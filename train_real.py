@@ -75,6 +75,7 @@ if args.scene in HYPERNERF_SCENES:
     # training parameters
     max_steps = 20000
     init_batch_size = 4096
+    target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # scene parameters
     aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
@@ -103,7 +104,8 @@ else:
 
     # training parameters
     max_steps = 20000
-    init_batch_size = 4096
+    init_batch_size = 1024
+    target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # scene parameters
     aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
@@ -132,16 +134,7 @@ train_dataset = SubjectLoader(
     root_fp=args.data_root,
     split=args.train_split,
     num_rays=init_batch_size,
-    max_steps=max_steps+1,
     **train_dataset_kwargs,
-)
-
-train_dataloader = torch.utils.data.DataLoader(
-    train_dataset,
-    num_workers=16,
-    persistent_workers=True,
-    batch_size=None,
-    # pin_memory=True
 )
 
 test_dataset = SubjectLoader(
@@ -152,15 +145,8 @@ test_dataset = SubjectLoader(
     **test_dataset_kwargs,
 )
 
-test_dataloader = torch.utils.data.DataLoader(
-    test_dataset,
-    num_workers=16,
-    persistent_workers=True,
-    batch_size=None,
-)
-
 estimator = OccGridEstimator(
-    roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl
+    roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl,
 )
 
 if args.scene in HYPERNERF_SCENES:
@@ -224,9 +210,12 @@ scheduler = torch.optim.lr_scheduler.ChainedScheduler(
 tic = time.time()
 # pre-set the len of train_dataloader to max_steps,
 # so that we can use just iterate over it.
-for step, data in enumerate(train_dataloader):
+for step in range(max_steps + 1):
     radiance_field.train()
     estimator.train()
+
+    i = torch.randint(0, len(train_dataset), (1,)).item()
+    data = train_dataset[i]
 
     render_bkgd = data["color_bkgd"].to(device)
     rays = namedtuple_map(lambda r: r.to(device), data["rays"])
@@ -238,6 +227,7 @@ for step, data in enumerate(train_dataloader):
         t = timestamps[t_idxs]
         density = radiance_field.query_density(x, t)['density']
         return density * render_step_size
+    
 
     # update occupancy grid
     estimator.update_every_n_steps(
@@ -261,6 +251,14 @@ for step, data in enumerate(train_dataloader):
     )
     if n_rendering_samples == 0:
         continue
+
+    if target_sample_batch_size > 0:
+        # dynamic batch size for rays to keep sample batch size constant.
+        num_rays = len(pixels)
+        num_rays = int(
+            num_rays * (target_sample_batch_size / float(n_rendering_samples))
+        )
+        train_dataset.update_num_rays(num_rays)
 
     # compute loss
     loss = F.mse_loss(rgb, pixels)
@@ -303,9 +301,10 @@ for step, data in enumerate(train_dataloader):
         with torch.no_grad():
             progress_bar = tqdm.tqdm(total=len(test_dataset), desc=f'evaluating: ')
 
-            for test_step, data in enumerate(test_dataloader):
+            for test_step in range(len(test_dataset)):
                 progress_bar.update()
 
+                data = test_dataset[test_step]
                 render_bkgd = data["color_bkgd"].to(device)
                 rays = namedtuple_map(lambda r: r.to(device), data["rays"])
                 pixels = data["pixels"].to(device)

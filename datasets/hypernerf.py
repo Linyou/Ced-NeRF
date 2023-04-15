@@ -314,8 +314,6 @@ class SubjectLoader(torch.utils.data.Dataset):
         read_image=True,
         add_cam=False,
         device: str = "cpu",
-        max_steps: int = 20000,
-
     ):
         super().__init__()
         assert split in self.SPLITS, "%s" % split
@@ -328,8 +326,6 @@ class SubjectLoader(torch.utils.data.Dataset):
         )
         self.color_bkgd_aug = color_bkgd_aug
         self.batch_over_images = batch_over_images
-
-        self.max_steps = max_steps
 
         # get sub split
         for sub_split in self.SUB_SPLIT:
@@ -400,10 +396,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         print(f"image width: {self.width}, height: {self.height}")
 
     def __len__(self):
-        if 'train' in self.split:
-            return self.max_steps
-        else:
-            return len(self.images)
+        return len(self.images)
 
     def to(self, device):
         self.K = self.K.to(device)

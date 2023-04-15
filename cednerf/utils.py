@@ -204,7 +204,7 @@ def render_image_test(
 
     rays_o = rays.origins
     rays_d = rays.viewdirs
-
+    
     near_planes = torch.full_like(rays_o[..., 0], fill_value=near_plane)
     far_planes = torch.full_like(rays_o[..., 0], fill_value=far_plane)
 
