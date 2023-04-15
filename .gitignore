@@ -138,3 +138,6 @@ dmypy.json
 
 # ignore nerfvis_scenes directory
 !nerfvis_scenes
+
+# ignore imgui ini file
+!imgui.ini
