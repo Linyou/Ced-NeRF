@@ -18,7 +18,7 @@ python train_real.py --data_root /home/loyot/workspace/Datasets/NeRF/3d_vedio_da
 
 ## TODO before release
 
-- [ ] Add DNeRF dataset support 
+- [x] Add DNeRF dataset support 
 - [ ] Fuse encoder and MLP after training
 - [ ] Support visualization on camera pose and radiance field
 - [ ] Add taichi-ngp-renderer support
