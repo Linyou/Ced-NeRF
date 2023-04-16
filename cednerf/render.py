@@ -86,26 +86,24 @@ def rendering(
         selector = interal_output["selector"]
         if "latent_losses" in interal_output:
             latent_losses = interal_output["latent_losses"]
-            latent_losses = reduce_along_rays(
+            extras["latent_losses"] = reduce_along_rays(
                                 ray_indices,
                                 values=latent_losses,
                                 n_rays=n_rays,
-                                weights=weights,
+                                weights=weights[:, None],
                             )
-            interal_output["latent_losses"] = latent_losses
         if "weight_losses" in interal_output:
-            target_weights = trans
-            p_weight = interal_output["weight_losses"]
-            weight_loss = F.huber_loss(p_weight, target_weights, reduction='none') * selector[..., None]
-            weight_loss = reduce_along_rays(
+            target_weights = trans[:, None]
+            # tiny-cuda-nn output float16
+            p_weight = interal_output["weight_losses"].float() 
+            weight_loss = F.huber_loss(p_weight, target_weights, reduction='none')
+            extras["weight_losses"] = reduce_along_rays(
                             ray_indices,
-                            values=weight_loss,
+                            values=weight_loss * selector[:, None],
                             n_rays=n_rays,
-                            weights=weights,
+                            weights=weights[:, None].detach(),
                         )
-            interal_output["weight_losses"] = weight_loss
         
-        extras["interal_output"] = interal_output
 
     # move_norm_view = move_norm[:, None]
     # w_dim = sigmas.dim()

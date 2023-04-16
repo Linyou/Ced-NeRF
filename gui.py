@@ -200,7 +200,7 @@ class GUI:
             self.timestamps = torch.tensor([0.0], device=device)
         else:
             self.timestamps = None
-        self.max_samples = 100
+        self.max_samples = 200
 
     @torch.no_grad()
     def render_frame(self):
@@ -316,6 +316,7 @@ class GUI:
 
             with gui.sub_window("Options", 0.01, 0.01, 0.4, 0.3) as w:
                 self.cam.rotate_speed = w.slider_float('rotate speed', self.cam.rotate_speed, 0.1, 1.)
+                self.max_samples = w.slider_int('max samples', self.max_samples, 1, 1024)
 
                 timestamps = w.slider_float('timestamps', timestamps, 0., 1.)
                 if last_timestamps != timestamps:

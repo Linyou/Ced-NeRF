@@ -75,7 +75,7 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     # training parameters
     max_steps = 20000
     init_batch_size = 1024
-    target_sample_batch_size = 1 << 18
+    target_sample_batch_size = 1 << 16
     weight_decay = 0.0
     # weight_decay = (
     #     1e-5 if args.scene in ["materials", "ficus", "drums"] else 1e-6
@@ -88,7 +88,8 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     train_dataset_kwargs = {}
     test_dataset_kwargs = {}
     # model parameters
-    hash_dst_resolution = 4096
+    moving_step = 1/2048
+    hash_dst_resolution = 2048
     grid_resolution = 128
     grid_nlvl = 1
     # render parameters
@@ -213,13 +214,14 @@ else:
 grad_scaler = torch.cuda.amp.GradScaler(2**10)
 radiance_field = DNGPradianceField(
     aabb=estimator.aabbs[-1],
-    moving_step=args.moving_step,
+    moving_step=moving_step,
     dst_resolution=hash_dst_resolution,
     use_div_offsets=args.use_div_offsets,
     use_time_embedding=args.use_time_embedding,
     use_time_attenuation=args.use_time_attenuation,
     use_feat_predict=args.use_feat_predict,
     use_weight_predict=args.use_weight_predict,
+    # time_inject_before_sigma=False,
 ).to(device)
 
 try:
@@ -299,9 +301,10 @@ for step in range(max_steps + 1):
         train_dataset.update_num_rays(num_rays)
 
     # compute loss
-    loss = F.mse_loss(rgb, pixels)
+    loss = F.huber_loss(rgb, pixels)
 
     for interal_data in extra:
+    
         if args.distortion_loss:
             loss += distortion(
                 interal_data['ray_indices'], 

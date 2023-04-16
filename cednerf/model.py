@@ -43,6 +43,7 @@ class DNGPradianceField(torch.nn.Module):
         use_div_offsets: bool = False,
         use_time_embedding: bool = False,
         use_time_attenuation: bool = False,
+        time_inject_before_sigma: bool = True,
         hash4motion: bool = False,    
     ) -> None:
         super().__init__()
@@ -62,7 +63,7 @@ class DNGPradianceField(torch.nn.Module):
         )  # 1.4472692012786865
         # per_level_scale = 1.4472692012786865
 
-        print('--NGPDradianceField configuration--')
+        print('--DNGPradianceField configuration--')
         print(f'  moving_step: {moving_step}')
         print(f'  hash b: {per_level_scale:6f}')
         print(f'  use_div_offsets: {use_div_offsets}')
@@ -70,6 +71,7 @@ class DNGPradianceField(torch.nn.Module):
         print(f'  use_weight_predict: {use_weight_predict}')
         print(f'  use_time_embedding: {use_time_embedding}')
         print(f'  use_time_attenuation: {use_time_attenuation}')
+        print(f'  time_inject_before_sigma: {time_inject_before_sigma}')
         print('-----------------------------------')
 
         self.use_feat_predict = use_feat_predict
@@ -78,6 +80,8 @@ class DNGPradianceField(torch.nn.Module):
         self.use_time_attenuation = use_time_attenuation
         self.MOVING_STEP = moving_step
         self.use_div_offsets = use_div_offsets
+
+        self.time_inject_before_sigma = time_inject_before_sigma
 
         self.loose_move = False
 
@@ -120,11 +124,6 @@ class DNGPradianceField(torch.nn.Module):
                             "otype": "Frequency",
                             "n_frequencies": 8
                         },
-                        # {
-                        #     "n_dims_to_encode": 1,
-                        #     "otype": "Frequency",
-                        #     # "n_frequencies": 8
-                        # },
                         # {"otype": "Identity", "n_bins": 4, "degree": 4},
                     ],
                 },
@@ -170,15 +169,22 @@ class DNGPradianceField(torch.nn.Module):
         )
 
         input_dim4base = self.hash_encoder.n_output_dims
+        self.geo_feat_dim_head = self.geo_feat_dim
 
         if self.use_time_embedding:
             self.time_encoder = SinusoidalEncoder(1, 0, 4, True)
             self.time_encoder_feat = SinusoidalEncoderWithExp(1, 0, 6, True)
 
             if self.use_time_attenuation:
-                input_dim4base += self.time_encoder_feat.latent_dim
+                if self.time_inject_before_sigma:
+                    input_dim4base += self.time_encoder_feat.latent_dim
+                else:
+                    self.geo_feat_dim_head  += self.time_encoder_feat.latent_dim
             else:
-                input_dim4base += self.time_encoder.latent_dim
+                if self.time_inject_before_sigma:
+                    input_dim4base += self.time_encoder.latent_dim
+                else:
+                    self.geo_feat_dim_head  += self.time_encoder.latent_dim
 
         self.mlp_base = tcnn.Network(
             n_input_dims=input_dim4base,
@@ -199,7 +205,7 @@ class DNGPradianceField(torch.nn.Module):
                         if self.use_viewdirs
                         else 0
                     )
-                    + self.geo_feat_dim
+                    + self.geo_feat_dim_head 
                 ),
                 n_output_dims=3,
                 network_config={
@@ -230,7 +236,7 @@ class DNGPradianceField(torch.nn.Module):
             )
 
         if self.use_weight_predict:
-            self.mlp_time_to_weight = tcnn.NetworkWithInputEncoding(
+            self.mlp_weight_prediction = tcnn.NetworkWithInputEncoding(
                 n_input_dims=num_dim+1,
                 encoding_config={
                     "otype": "Frequency",
@@ -245,6 +251,14 @@ class DNGPradianceField(torch.nn.Module):
                     "n_hidden_layers": 1,
                 },
             )
+
+    def swap_fused_sigmas(self):
+        '''
+            This function is to replace the separated 
+            hash_encoder and the mlp_base to a fused one.
+            It should be much faster.
+        '''
+        pass
 
     def query_move(self, x, t):
         offsets = self.xyz_wrap(torch.cat([x, t], dim=-1))
@@ -279,7 +293,7 @@ class DNGPradianceField(torch.nn.Module):
         selector = ((x > 0.0) & (x < 1.0)).all(dim=-1)
         hash_feat = self.hash_encoder(x_move)
 
-        if self.use_time_embedding:
+        if self.use_time_embedding and self.time_inject_before_sigma:
             if self.use_time_attenuation:
                 time_encode = self.time_encoder_feat(t.view(-1, 1), move_norm.detach())
             else:
@@ -303,12 +317,19 @@ class DNGPradianceField(torch.nn.Module):
             * selector[..., None]
         )
 
-
         results = {}
         results['density'] = density
 
         if return_feat:
-            results['base_mlp_out'] = base_mlp_out
+            if self.use_time_embedding and (not self.time_inject_before_sigma):
+                if self.use_time_attenuation:
+                    time_encode = self.time_encoder_feat(t.view(-1, 1), move_norm.detach())
+                else:
+                    time_encode = self.time_encoder(t.view(-1, 1))
+
+                results['base_mlp_out'] = torch.cat([base_mlp_out, time_encode], dim=-1)
+            else:
+                results['base_mlp_out'] = base_mlp_out
 
         if return_interal:
             if self.use_feat_predict or self.use_weight_predict:
@@ -322,8 +343,7 @@ class DNGPradianceField(torch.nn.Module):
                     interal_output['latent_losses'] = loss_feat
 
                 if self.use_weight_predict:
-                    predict_weight = self.mlp_time_to_weight(temp_feat)
-                    interal_output['weight_losses'] = predict_weight
+                    interal_output['weight_losses'] = self.mlp_weight_prediction(temp_feat)
 
                 results['interal_output'] = interal_output
 
@@ -338,9 +358,9 @@ class DNGPradianceField(torch.nn.Module):
 
             dir = (dir + 1.0) / 2.0
             d = self.direction_encoding(dir.reshape(-1, dir.shape[-1]))
-            h = torch.cat([d, embedding.reshape(-1, self.geo_feat_dim)], dim=-1)
+            h = torch.cat([d, embedding.reshape(-1, self.geo_feat_dim_head)], dim=-1)
         else:
-            h = embedding.reshape(-1, self.geo_feat_dim)
+            h = embedding.reshape(-1, self.geo_feat_dim_head)
         rgb = (
             self.mlp_head(h)
             .reshape(list(embedding.shape[:-1]) + [3])

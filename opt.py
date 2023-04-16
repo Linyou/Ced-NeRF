@@ -22,18 +22,6 @@ def get_model_args(parser):
         help="use a mlp to predict the weight feature",
     )
     parser.add_argument(
-        '-wr',
-        "--weight_rgbper",
-        action="store_true",
-        help="use weighted rgbs for rgb",
-    )
-    parser.add_argument(
-        '-ae',
-        "--acc_entorpy_loss",
-        action="store_true",
-        help="use accumulated opacites as entropy loss",
-    )
-    parser.add_argument(
         '-te',
         "--use_time_embedding",
         action="store_true",
@@ -56,10 +44,32 @@ def get_model_args(parser):
 
     # losses
     parser.add_argument(
+        '-o',
+        "--use_opacity_loss",
+        action="store_true",
+        help="use a opacity loss",
+    )
+
+    parser.add_argument(
         '-d',
         "--distortion_loss",
         action="store_true",
         help="use a distortion loss",
     )
+
+    parser.add_argument(
+        '-wr',
+        "--weight_rgbper",
+        action="store_true",
+        help="use weighted rgbs for rgb",
+    )
+    parser.add_argument(
+        '-ae',
+        "--acc_entorpy_loss",
+        action="store_true",
+        help="use accumulated opacites as entropy loss",
+    )
+
+
 
     return parser
