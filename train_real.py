@@ -25,6 +25,7 @@ from cednerf.utils import (
 from nerfacc.estimators.occ_grid import OccGridEstimator
 
 from datasets import (
+    DNERF_SYNTHETIC_SCENES,
     DYNERF_SCENES,
     HYPERNERF_SCENES
 )
@@ -52,7 +53,7 @@ parser.add_argument(
     "--scene",
     type=str,
     default="lego",
-    choices=DYNERF_SCENES + HYPERNERF_SCENES,
+    choices=DNERF_SYNTHETIC_SCENES + DYNERF_SCENES + HYPERNERF_SCENES,
     help="which scene to use",
 )
 
@@ -69,12 +70,44 @@ args = parser.parse_args()
 device = "cuda:0"
 set_random_seed(42)
 
-if args.scene in HYPERNERF_SCENES:
+if args.scene in DNERF_SYNTHETIC_SCENES:
+    from datasets.dnerf_synthetic import SubjectLoader
+    # training parameters
+    max_steps = 20000
+    init_batch_size = 1024
+    target_sample_batch_size = 1 << 18
+    weight_decay = 0.0
+    # weight_decay = (
+    #     1e-5 if args.scene in ["materials", "ficus", "drums"] else 1e-6
+    # )
+    # scene parameters
+    aabb = torch.tensor([-1.5, -1.5, -1.5, 1.5, 1.5, 1.5])
+    near_plane = 0.0
+    far_plane = 1.0e10
+    # dataset parameters
+    train_dataset_kwargs = {}
+    test_dataset_kwargs = {}
+    # model parameters
+    hash_dst_resolution = 4096
+    grid_resolution = 128
+    grid_nlvl = 1
+    # render parameters
+    render_step_size = 5e-3
+    alpha_thre = 0.0
+    cone_angle = 0.0
+    milestones=[
+        max_steps // 2,
+        max_steps * 3 // 4,
+        # max_steps * 5 // 6,
+        max_steps * 9 // 10,
+    ]
+
+elif args.scene in HYPERNERF_SCENES:
     from datasets.hypernerf import SubjectLoader
 
     # training parameters
     max_steps = 20000
-    init_batch_size = 4096
+    init_batch_size = 1024
     target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # scene parameters
@@ -162,7 +195,7 @@ if args.scene in HYPERNERF_SCENES:
     )
     # call mark_invisible_cells before sending the estimator to device.
     estimator = estimator.to(device)
-else:
+elif args.scene in DYNERF_SCENES:
     estimator = estimator.to(device)
     mark_invisible_K = train_dataset.K
     estimator.mark_invisible_cells(
@@ -171,6 +204,9 @@ else:
         [train_dataset.width, train_dataset.height],
         near_plane,
     )
+else:
+    estimator = estimator.to(device)
+    mark_invisible_K = train_dataset.K
 
 
 # setup the radiance field we want to train.
@@ -219,7 +255,6 @@ for step in range(max_steps + 1):
 
     i = torch.randint(0, len(train_dataset), (1,)).item()
     data = train_dataset[i]
-
     render_bkgd = data["color_bkgd"].to(device)
     rays = namedtuple_map(lambda r: r.to(device), data["rays"])
     pixels = data["pixels"].to(device)
@@ -282,8 +317,8 @@ for step in range(max_steps + 1):
             loss += entropy_loss*1e-3
 
         if args.weight_rgbper:
-            rgbper = (interal_data['rgbs'] - interal_data['ray_indices']).pow(2).sum(dim=-1)
-            loss += (rgbper * interal_data['weights'][:, 0].detach()).sum() / pixels.shape[0] * 1e-2
+            rgbper = (interal_data['rgbs'] - pixels[interal_data['ray_indices']]).pow(2).sum(dim=-1)
+            loss += (rgbper * interal_data['weights'].detach()).sum() / pixels.shape[0] * 1e-3
 
         if args.use_feat_predict:
             loss += interal_data['latent_losses'].mean()

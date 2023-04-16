@@ -108,9 +108,9 @@ class SubjectLoader(torch.utils.data.Dataset):
         ) = _load_renderings(root_fp, subject_id, split)
         self.images = torch.from_numpy(self.images).to(torch.uint8)
         self.camtoworlds = torch.from_numpy(self.camtoworlds).to(torch.float32)
-        self.timestamps = torch.from_numpy(self.timestamps).to(torch.float32)[
-            :, None
-        ]
+        self.timestamps = (
+            torch.from_numpy(self.timestamps).to(torch.float32)[:, None]
+        )
         self.K = torch.tensor(
             [
                 [self.focal, 0, self.WIDTH / 2.0],

@@ -94,7 +94,6 @@ class Camera:
         self.K = K
         self.W, self.H = img_wh
         self.radius = r
-        pose_np = pose
         if center is not None:
             self.center = center
         else:
@@ -102,7 +101,7 @@ class Camera:
         self.rot = np.eye(3)
         # self.center = pose_np[20][:3, 3]
         # self.rot = pose_np[50][:3, :3]
-        self.res_defalut = pose_np[20]
+        self.res_defalut = pose[0]
         self.rotate_speed = 0.8
 
         self.inner_rot = np.eye(3)
