@@ -86,6 +86,7 @@ if args.scene in HYPERNERF_SCENES:
     train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 2, "add_cam": add_cam}
     test_dataset_kwargs = {"factor": 2, "add_cam": add_cam}
     # model parameters
+    hash_dst_resolution = 4096
     grid_resolution = 128
     grid_nlvl = 2
     # render parameters
@@ -112,9 +113,10 @@ else:
     near_plane = 0.2
     far_plane = 1.0e10
     # dataset parameters
-    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
-    test_dataset_kwargs = {"factor": 4}
+    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 2}
+    test_dataset_kwargs = {"factor": 2}
     # model parameters
+    hash_dst_resolution = 4096
     grid_resolution = 128
     grid_nlvl = 4
     # render parameters
@@ -176,6 +178,7 @@ grad_scaler = torch.cuda.amp.GradScaler(2**10)
 radiance_field = DNGPradianceField(
     aabb=estimator.aabbs[-1],
     moving_step=args.moving_step,
+    dst_resolution=hash_dst_resolution,
     use_div_offsets=args.use_div_offsets,
     use_time_embedding=args.use_time_embedding,
     use_time_attenuation=args.use_time_attenuation,
@@ -272,6 +275,22 @@ for step in range(max_steps + 1):
                 interal_data['t_ends']
             ) * 1e-3
 
+        if args.acc_entorpy_loss:
+            T_last = 1 - acc
+            T_last = T_last.clamp(1e-6, 1-1e-6)
+            entropy_loss = -(T_last*torch.log(T_last) + (1-T_last)*torch.log(1-T_last)).mean()
+            loss += entropy_loss*1e-3
+
+        if args.weight_rgbper:
+            rgbper = (interal_data['rgbs'] - interal_data['ray_indices']).pow(2).sum(dim=-1)
+            loss += (rgbper * interal_data['weights'][:, 0].detach()).sum() / pixels.shape[0] * 1e-2
+
+        if args.use_feat_predict:
+            loss += interal_data['latent_losses'].mean()
+
+        if args.use_weight_predict:
+            loss += interal_data['weight_losses'].mean()
+
     
     optimizer.zero_grad()
     # do not unscale it because we are using Adam.
@@ -290,7 +309,7 @@ for step in range(max_steps + 1):
             f"max_depth={depth.max():.3f} | "
         )
 
-    if step > 0 and step % max_steps == 0 and not args.gui:
+    if step > 0 and step % max_steps == 0:
         torch.cuda.empty_cache()
         # evaluation
         radiance_field.eval()
@@ -361,6 +380,7 @@ if args.gui:
         'render_bkgd': torch.zeros(3, device=device),
         'render_step_size': render_step_size,
         'args_aabb': None,
+        'reverse_h': args.scene in DYNERF_SCENES, 
     }
     app = GUI(render_kwargs=gui_args, dnerf=True)
     app.render_gui()

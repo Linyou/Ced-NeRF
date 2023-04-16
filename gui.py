@@ -23,32 +23,38 @@ def depth2img(depth):
     return depth_img.astype(np.float32)
 
 @ti.kernel
-def write_buffer(W:ti.i32, H:ti.i32, x: ti.types.ndarray(), final_pixel:ti.template()):
+def write_buffer(
+    reverse_h: bool,
+    W:ti.i32, H:ti.i32, 
+    x: ti.types.ndarray(), 
+    final_pixel:ti.template()
+):
     for i, j in ti.ndrange(W, H):
+        j_rev = j
+        if reverse_h:
+            j_rev = H - j - 1
         for p in ti.static(range(3)):
-            final_pixel[i, j][p] = x[j, i, p]
+            final_pixel[i, j][p] = x[j_rev, i, p]
 
 import warnings; warnings.filterwarnings("ignore")
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-def get_rays(K, pose, width, height, opengl=True):
-
+def get_cam_dirs(K, width, height, opengl=True):
     x, y = torch.meshgrid(
-        torch.arange(width, device=device, dtype=torch.float16),
-        torch.arange(height, device=device, dtype=torch.float16),
+        torch.arange(width, device=device),
+        torch.arange(height, device=device),
         indexing="xy",
     )
     x = x.flatten()
     y = y.flatten()
 
-    # generate rays
-    c2w = pose[None, ...]  # (num_rays, 3, 4)
     camera_dirs = F.pad(
         torch.stack(
             [
                 (x - K[0, 2] + 0.5) / K[0, 0],
-                (y - K[1, 2] + 0.5) / K[1, 1]
+                (y - K[1, 2] + 0.5)
+                / K[1, 1]
                 * (-1.0 if opengl else 1.0),
             ],
             dim=-1,
@@ -56,6 +62,12 @@ def get_rays(K, pose, width, height, opengl=True):
         (0, 1),
         value=(-1.0 if opengl else 1.0),
     )  # [num_rays, 3]
+
+    return camera_dirs
+
+def gen_rays(pose, camera_dirs, width, height):
+    # generate rays
+    c2w = pose[None, ...]  # (num_rays, 3, 4)
 
     # [n_cams, height, width, 3]
     directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
@@ -65,16 +77,13 @@ def get_rays(K, pose, width, height, opengl=True):
         directions, dim=-1, keepdims=True
     )
 
-    # origins = torch.reshape(origins, (height, width, 3)).to(torch.float16)
-    # viewdirs = torch.reshape(viewdirs, (height, width, 3)).to(torch.float16)
-    # directions = torch.reshape(directions, (height, width, 3)).to(torch.float16)
     origins = torch.reshape(origins, (height, width, 3))
     viewdirs = torch.reshape(viewdirs, (height, width, 3))
     directions = torch.reshape(directions, (height, width, 3))
 
     rays = Rays(origins=origins, viewdirs=viewdirs)
 
-    return rays
+    return rays 
 
 
 class Camera:
@@ -150,7 +159,7 @@ class Camera:
 
 
 class GUI:
-    def __init__(self, radius=1.5, render_kwargs=None, dnerf=False, opengl=True):
+    def __init__(self, radius=1.5, render_kwargs=None, dnerf=False):
 
         device = "cuda:0"
 
@@ -160,7 +169,6 @@ class GUI:
         self.test_camtoworlds = render_kwargs['test_camtoworlds']
         self.train_img_lens = render_kwargs['train_img_lens']
         self.test_img_lens = render_kwargs['test_img_lens']
-
 
         self.radiance_field = render_kwargs['radiance_field']
         self.estimator = render_kwargs['estimator']
@@ -173,8 +181,7 @@ class GUI:
         self.render_bkgd = render_kwargs['render_bkgd']
         self.args_aabb = render_kwargs['args_aabb']
 
-        self.get_rays_func = get_rays
-
+        self.reverse_h = render_kwargs['reverse_h']
 
         self.radiance_field.eval()
         self.estimator.eval()
@@ -182,6 +189,8 @@ class GUI:
 
         self.cam = Camera(K, img_wh, self.test_camtoworlds, r=radius)
         self.W, self.H = img_wh
+
+        self.cam_dirs = get_cam_dirs(K, self.W, self.H)
 
         # placeholders
         self.dt = 0
@@ -194,37 +203,38 @@ class GUI:
             self.timestamps = None
         self.max_samples = 100
 
-        self.opengl = opengl
-
     @torch.no_grad()
     def render_frame(self):
         t = time.time()
         # print(cam.pose)
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            rays = self.get_rays_func(self.cam.K, torch.cuda.FloatTensor(self.cam.pose), self.W, self.H, opengl=self.opengl)
-            rgb, _, depth, n_rendering_samples = render_image_test(
-                self.max_samples,
-                self.radiance_field,
-                self.estimator,
-                rays,
-                # rendering options
-                near_plane=self.near_plane,
-                render_step_size=self.render_step_size,
-                render_bkgd=self.render_bkgd,
-                cone_angle=self.cone_angle,
-                alpha_thre=self.alpha_thre,
-                # dnerf
-                timestamps=self.timestamps,
-            )
+        rays = gen_rays(
+            torch.cuda.FloatTensor(self.cam.pose), 
+            self.cam_dirs,
+            self.W, self.H
+        )
+        rgb, _, depth, n_rendering_samples = render_image_test(
+            self.max_samples,
+            self.radiance_field,
+            self.estimator,
+            rays,
+            # rendering options
+            near_plane=self.near_plane,
+            render_step_size=self.render_step_size,
+            render_bkgd=self.render_bkgd,
+            cone_angle=self.cone_angle,
+            alpha_thre=self.alpha_thre,
+            # dnerf
+            timestamps=self.timestamps,
+        )
 
-            depth = depth.squeeze(-1)
-            self.dt = time.time()-t
-            self.mean_samples = n_rendering_samples/(self.W * self.H)
+        depth = depth.squeeze(-1)
+        self.dt = time.time()-t
+        self.mean_samples = n_rendering_samples/(self.W * self.H)
 
-            if self.img_mode == 0:
-                return rgb
-            elif self.img_mode == 1:
-                return depth2img(depth)/255.0
+        if self.img_mode == 0:
+            return rgb
+        elif self.img_mode == 1:
+            return depth2img(depth)/255.0
 
 
 
@@ -363,7 +373,7 @@ class GUI:
                 w.text(f'{ref_c2w[2]}')
 
             render_buffer = self.render_frame()
-            write_buffer(W, H, render_buffer, final_pixel)
+            write_buffer(self.reverse_h, W, H, render_buffer, final_pixel)
             canvas.set_image(final_pixel)
             window.show()
 

@@ -298,7 +298,7 @@ class SubjectLoader(torch.utils.data.Dataset):
         'vrig_',
     ]
 
-    OPENGL_CAMERA = False
+    OPENGL_CAMERA = True
 
     def __init__(
         self,
