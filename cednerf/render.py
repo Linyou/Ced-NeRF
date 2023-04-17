@@ -101,7 +101,7 @@ def rendering(
                             ray_indices,
                             values=weight_loss * selector[:, None],
                             n_rays=n_rays,
-                            weights=weights[:, None].detach(),
+                            weights=weights[:, None],
                         )
         
 

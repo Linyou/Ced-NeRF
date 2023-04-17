@@ -74,8 +74,8 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     from datasets.dnerf_synthetic import SubjectLoader
     # training parameters
     max_steps = 20000
-    init_batch_size = 1024
-    target_sample_batch_size = 1 << 16
+    init_batch_size = 8192
+    target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # weight_decay = (
     #     1e-5 if args.scene in ["materials", "ficus", "drums"] else 1e-6
@@ -181,6 +181,10 @@ test_dataset = SubjectLoader(
     **test_dataset_kwargs,
 )
 
+if args.scene in DNERF_SYNTHETIC_SCENES:
+    train_dataset = train_dataset.to(device)
+    test_dataset = test_dataset.to(device)
+
 estimator = OccGridEstimator(
     roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl,
 )
@@ -211,7 +215,7 @@ else:
 
 
 # setup the radiance field we want to train.
-grad_scaler = torch.cuda.amp.GradScaler(2**10)
+grad_scaler = torch.cuda.amp.GradScaler()
 radiance_field = DNGPradianceField(
     aabb=estimator.aabbs[-1],
     moving_step=moving_step,
@@ -257,10 +261,16 @@ for step in range(max_steps + 1):
 
     i = torch.randint(0, len(train_dataset), (1,)).item()
     data = train_dataset[i]
-    render_bkgd = data["color_bkgd"].to(device)
-    rays = namedtuple_map(lambda r: r.to(device), data["rays"])
-    pixels = data["pixels"].to(device)
-    timestamps = data["timestamps"].to(device)
+    if args.scene in DNERF_SYNTHETIC_SCENES:
+        render_bkgd = data["color_bkgd"]
+        rays = data["rays"]
+        pixels = data["pixels"]
+        timestamps = data["timestamps"]
+    else:
+        render_bkgd = data["color_bkgd"].to(device)
+        rays = namedtuple_map(lambda r: r.to(device), data["rays"])
+        pixels = data["pixels"].to(device)
+        timestamps = data["timestamps"].to(device)
 
     def occ_eval_fn(x):
         t_idxs = torch.randint(0, len(timestamps), (x.shape[0],), device=x.device)
@@ -268,7 +278,7 @@ for step in range(max_steps + 1):
         density = radiance_field.query_density(x, t)['density']
         return density * render_step_size
     
-
+    # with torch.autocast(device_type='cuda', dtype=torch.float16):
     # update occupancy grid
     estimator.update_every_n_steps(
         step=step,
@@ -292,16 +302,18 @@ for step in range(max_steps + 1):
     if n_rendering_samples == 0:
         continue
 
-    if target_sample_batch_size > 0:
-        # dynamic batch size for rays to keep sample batch size constant.
-        num_rays = len(pixels)
-        num_rays = int(
-            num_rays * (target_sample_batch_size / float(n_rendering_samples))
-        )
-        train_dataset.update_num_rays(num_rays)
+    # if target_sample_batch_size > 0:
+    #     # dynamic batch size for rays to keep sample batch size constant.
+    #     num_rays = len(pixels)
+    #     num_rays = int(
+    #         num_rays * (target_sample_batch_size / float(n_rendering_samples))
+    #     )
+    #     train_dataset.update_num_rays(num_rays)
 
     # compute loss
     loss = F.huber_loss(rgb, pixels)
+
+    # loss += (-acc*torch.log(acc)).mean()*1e-4
 
     for interal_data in extra:
     
@@ -335,6 +347,11 @@ for step in range(max_steps + 1):
     grad_scaler.scale(loss).backward()
     optimizer.step()
     scheduler.step()
+    # grad_scaler.step(optimizer)
+    # scale = grad_scaler.get_scale()
+    # grad_scaler.update()
+    # if not scale > grad_scaler.get_scale():
+    #     scheduler.step()
 
     if step % 10000 == 0:
         elapsed_time = time.time() - tic
@@ -362,14 +379,19 @@ for step in range(max_steps + 1):
                 progress_bar.update()
 
                 data = test_dataset[test_step]
-                render_bkgd = data["color_bkgd"].to(device)
-                rays = namedtuple_map(lambda r: r.to(device), data["rays"])
-                pixels = data["pixels"].to(device)
-                timestamps = data["timestamps"].to(device)
+                if args.scene in DNERF_SYNTHETIC_SCENES:
+                    render_bkgd = data["color_bkgd"]
+                    rays = data["rays"]
+                    pixels = data["pixels"]
+                    timestamps = data["timestamps"]
+                else:
+                    render_bkgd = data["color_bkgd"].to(device)
+                    rays = namedtuple_map(lambda r: r.to(device), data["rays"])
+                    pixels = data["pixels"].to(device)
+                    timestamps = data["timestamps"].to(device)
 
                 # rendering
-                rgb, acc, depth, _ = render_image_test(
-                    1024,
+                rgb, acc, depth, n_rendering_samples, extra = render_image(
                     radiance_field,
                     estimator,
                     rays,
@@ -381,6 +403,19 @@ for step in range(max_steps + 1):
                     alpha_thre=alpha_thre,
                     timestamps=timestamps,
                 )
+                # rgb, acc, depth, _ = render_image_test(
+                #     1024,
+                #     radiance_field,
+                #     estimator,
+                #     rays,
+                #     # rendering options
+                #     near_plane=near_plane,
+                #     render_step_size=render_step_size,
+                #     render_bkgd=render_bkgd,
+                #     cone_angle=cone_angle,
+                #     alpha_thre=alpha_thre,
+                #     timestamps=timestamps,
+                # )
                 mse = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(mse) / np.log(10.0)
                 psnrs.append(psnr.item())
@@ -402,6 +437,11 @@ for step in range(max_steps + 1):
 
 if args.gui:
     torch.cuda.empty_cache()
+    white_bkgd = torch.ones(3, device=device)
+    black_bkgd = torch.zeros(3, device=device)
+    render_bkgd = (
+        white_bkgd if args.scene in DNERF_SYNTHETIC_SCENES else black_bkgd
+    )
     gui_args = {
         'K': mark_invisible_K,
         'img_wh': (test_dataset.width, test_dataset.height),
@@ -415,7 +455,7 @@ if args.gui:
         'alpha_thre': alpha_thre,
         'cone_angle': cone_angle,
         # 'test_chunk_size': args.test_chunk_size,
-        'render_bkgd': torch.zeros(3, device=device),
+        'render_bkgd': render_bkgd,
         'render_step_size': render_step_size,
         'args_aabb': None,
         'reverse_h': args.scene in DYNERF_SCENES, 

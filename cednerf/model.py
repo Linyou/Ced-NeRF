@@ -293,13 +293,16 @@ class DNGPradianceField(torch.nn.Module):
         selector = ((x > 0.0) & (x < 1.0)).all(dim=-1)
         hash_feat = self.hash_encoder(x_move)
 
-        if self.use_time_embedding and self.time_inject_before_sigma:
+        if self.use_time_embedding:
             if self.use_time_attenuation:
                 time_encode = self.time_encoder_feat(t.view(-1, 1), move_norm.detach())
             else:
                 time_encode = self.time_encoder(t.view(-1, 1))
 
-            cat_feat = torch.cat([hash_feat, time_encode], dim=-1)
+            if self.time_inject_before_sigma:
+                cat_feat = torch.cat([hash_feat, time_encode], dim=-1)
+            else:
+                cat_feat = hash_feat
         else:
             cat_feat = hash_feat
 
@@ -322,11 +325,6 @@ class DNGPradianceField(torch.nn.Module):
 
         if return_feat:
             if self.use_time_embedding and (not self.time_inject_before_sigma):
-                if self.use_time_attenuation:
-                    time_encode = self.time_encoder_feat(t.view(-1, 1), move_norm.detach())
-                else:
-                    time_encode = self.time_encoder(t.view(-1, 1))
-
                 results['base_mlp_out'] = torch.cat([base_mlp_out, time_encode], dim=-1)
             else:
                 results['base_mlp_out'] = base_mlp_out
