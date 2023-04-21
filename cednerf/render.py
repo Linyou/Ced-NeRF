@@ -3,7 +3,7 @@ from torch import Tensor
 import torch.nn.functional as F
 from typing import Callable, Optional, Tuple
 
-from nerfacc import render_weight_from_density, accumulate_along_rays
+from nerfacc import render_weight_from_density, accumulate_along_rays, render_transmittance_from_density
 
 def reduce_along_rays(
     ray_indices: Tensor,
@@ -37,6 +37,22 @@ def reduce_along_rays(
     outputs.scatter_reduce_(0, index, src, reduce="mean")
     return outputs
 
+
+def render_weight_from_density_prefix(
+    t_starts: Tensor,
+    t_ends: Tensor,
+    sigmas: Tensor,
+    prefix_trans: Tensor,
+    packed_info: Optional[Tensor] = None,
+    ray_indices: Optional[Tensor] = None,
+    n_rays: Optional[int] = None,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Render the weights of the rays through the density field."""
+    trans, alphas = render_transmittance_from_density(
+        t_starts, t_ends, sigmas, packed_info, ray_indices, n_rays, prefix_trans
+    )
+    weights = trans * alphas
+    return weights, trans, alphas
 
 def rendering(
     # ray marching results

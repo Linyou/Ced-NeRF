@@ -122,7 +122,7 @@ class DNGPradianceField(torch.nn.Module):
                         {
                             "n_dims_to_encode": 4,
                             "otype": "Frequency",
-                            "n_frequencies": 8
+                            "n_frequencies": 4
                         },
                         # {"otype": "Identity", "n_bins": 4, "degree": 4},
                     ],
@@ -133,7 +133,7 @@ class DNGPradianceField(torch.nn.Module):
                     "activation": "ReLU",
                     "output_activation": "None",
                     "n_neurons": 64,
-                    "n_hidden_layers": 3,
+                    "n_hidden_layers": 2,
                 },
             )
 
@@ -270,23 +270,22 @@ class DNGPradianceField(torch.nn.Module):
             fine_move = 0
 
         move = grid_move + fine_move
-        move_norm = move.norm(dim=-1)[:, None]
 
-        return x + move, move_norm
+        return x + move, move
 
     def query_density(self, x, t, return_feat: bool = False, return_interal: bool = False):
 
-        aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
-        x = (x - aabb_min) / (aabb_max - aabb_min)
-
         if (not self.loose_move) and x.shape[0] > 0:
-            x_move, move_norm = self.query_move(
+            x_move, move = self.query_move(
                 x.view(-1, self.num_dim), 
                 t.view(-1, 1)
             )
         else:
             x_move = x.view(-1, self.num_dim)
-            move_norm = torch.zeros_like(x_move[:, :1])
+            move = torch.zeros_like(x_move[:, :1])
+
+        aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
+        x_move = (x_move - aabb_min) / (aabb_max - aabb_min)
 
         x = x_move.view_as(x)
 
@@ -294,10 +293,16 @@ class DNGPradianceField(torch.nn.Module):
         hash_feat = self.hash_encoder(x_move)
 
         if self.use_time_embedding:
-            if self.use_time_attenuation:
-                time_encode = self.time_encoder_feat(t.view(-1, 1), move_norm.detach())
-            else:
-                time_encode = self.time_encoder(t.view(-1, 1))
+            with torch.no_grad():
+                if self.use_time_attenuation:
+                    move = torch.linalg.norm(move.detach(), dim=-1)
+                    # print("max move: ", move.max())
+                    # print("min move: ", move.min())
+                    time_encode = self.time_encoder_feat(
+                        t.view(-1, 1), move.view(-1, 1)
+                    )
+                else:
+                    time_encode = self.time_encoder(t.view(-1, 1))
 
             if self.time_inject_before_sigma:
                 cat_feat = torch.cat([hash_feat, time_encode], dim=-1)

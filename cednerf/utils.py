@@ -12,7 +12,7 @@ from datasets.utils import Rays, namedtuple_map
 from nerfacc.estimators.occ_grid import OccGridEstimator
 from nerfacc import traverse_grids, ray_aabb_intersect
 
-from .render import rendering
+from .render import rendering, render_weight_from_density_prefix, accumulate_along_rays
 from .taichi_kernel import composite_test
 
 def set_random_seed(seed):
@@ -177,7 +177,7 @@ def render_image_test(
     def rgb_sigma_fn(t_starts, t_ends, ray_indices):
         t_origins = rays.origins[ray_indices]
         t_dirs = rays.viewdirs[ray_indices]
-        positions = t_origins + t_dirs * (t_starts + t_ends) / 2.0
+        positions = t_origins + t_dirs * (t_starts[:, None] + t_ends[:, None]) / 2.0
         if timestamps is not None:
             # dnerf
             t = (
@@ -188,7 +188,7 @@ def render_image_test(
             rgbs, sigmas = radiance_field(positions, t, t_dirs)
         else:
             rgbs, sigmas = radiance_field(positions, t_dirs)
-        return rgbs, sigmas['density']
+        return rgbs, sigmas['density'].squeeze(-1)
 
     N_rays = rays.origins.shape[0]
     device = rays.origins.device
@@ -238,56 +238,83 @@ def render_image_test(
             termination_planes
         ) = traverse_grids(
             # rays
-            rays_o.contiguous(),  # [n_rays, 3]
-            rays_d.contiguous(),  # [n_rays, 3]
+            rays_o,  # [n_rays, 3]
+            rays_d,  # [n_rays, 3]
             # grids
-            estimator.binaries.contiguous(),  # [m, resx, resy, resz]
-            estimator.aabbs.contiguous(),  # [m, 6]
+            estimator.binaries,  # [m, resx, resy, resz]
+            estimator.aabbs,  # [m, 6]
             # options
-            near_planes.contiguous(),  # [n_rays]
-            far_planes.contiguous(),  # [n_rays]
+            near_planes,  # [n_rays]
+            far_planes,  # [n_rays]
             render_step_size,
             cone_angle,
             N_samples,
-            ray_mask_id.contiguous(), 
+            ray_mask_id, 
             # pre-compute intersections
-            t_sorted.contiguous(),  # [n_rays, m*2]
-            t_indices.contiguous(),  # [n_rays, m*2]
-            hits.contiguous(),  # [n_rays, m]
+            t_sorted,  # [n_rays, m*2]
+            t_indices,  # [n_rays, m*2]
+            hits,  # [n_rays, m]
         )
-        t_starts = intervals.vals[intervals.is_left][:, None]
-        t_ends = intervals.vals[intervals.is_right][:, None]
+        t_starts = intervals.vals[intervals.is_left]
+        t_ends = intervals.vals[intervals.is_right]
+        ray_indices_local = intervals.ray_indices[intervals.is_right]
         ray_indices = samples.ray_indices[samples.is_valid]
         packed_info = samples.packed_info
 
         # get rgb and sigma from radiance field
         rgbs, sigmas = rgb_sigma_fn(t_starts, t_ends, ray_indices)
-
-        # debug_str += f"t_min[{ray_mask_id[0]}]: {near_planes[ray_mask_id[0]]} | "
-        # volume rendering
-        composite_test(
-            # input args
-            sigmas.contiguous(), 
-            rgbs.contiguous(), 
-            t_starts.contiguous(),
-            t_ends.contiguous(), 
-            packed_info.contiguous(), 
-            ray_mask_id.contiguous(), 
-            early_stop_eps, 
-            alpha_thre,
-            # output args
-            opacity.contiguous(), 
-            depth.contiguous(), 
-            rgb.contiguous()
+         # volume rendering
+        # native cuda scan
+        weights, _, _ = render_weight_from_density_prefix(
+            t_starts,
+            t_ends,
+            sigmas,
+            ray_indices=ray_indices_local,
+            n_rays=N_alive,
+            prefix_trans=1 - opacity[ray_indices].squeeze(-1),
         )
+        rgb[ray_mask_id] += accumulate_along_rays(
+            weights, values=rgbs, ray_indices=ray_indices_local, n_rays=N_alive
+        )
+        opacity[ray_mask_id] += accumulate_along_rays(
+            weights, values=None, ray_indices=ray_indices_local, n_rays=N_alive
+        )
+        depth[ray_mask_id] += accumulate_along_rays(
+            weights,
+            values=(t_starts + t_ends)[..., None] / 2.0,
+            ray_indices=ray_indices_local,
+            n_rays=N_alive,
+        )
+        # debug_str += f"t_min[{ray_mask_id[0]}]: {near_planes[ray_mask_id[0]]} | "
+        # taichi kernel 
+        # composite_test(
+        #     # input args
+        #     sigmas.contiguous(), 
+        #     rgbs.contiguous(), 
+        #     t_starts.contiguous(),
+        #     t_ends.contiguous(), 
+        #     packed_info.contiguous(), 
+        #     ray_mask_id.contiguous(), 
+        #     early_stop_eps, 
+        #     alpha_thre,
+        #     # output args
+        #     opacity.contiguous(), 
+        #     depth.contiguous(), 
+        #     rgb.contiguous()
+        # )
         # update near_planes using termination planes
         near_planes[ray_mask_id] = termination_planes
-         # update rays status
-        ray_mask_id = ray_mask_id[ray_mask_id>=0]
+        # update rays status
+        mask = torch.logical_or(
+            opacity[ray_mask_id, 0] > (1 - early_stop_eps) ,
+            packed_info[:, 1] == 0
+        )
+        ray_mask_id = ray_mask_id[~mask]
         total_samples += ray_indices.shape[0]
         # print(debug_str)
     
     rgb = rgb + render_bkgd * (1.0 - opacity)
+    depth = depth / opacity.clamp_min(torch.finfo(rgbs.dtype).eps)
 
     return (
         rgb.view((*rays_shape[:-1], -1)),

@@ -206,25 +206,26 @@ class GUI:
     def render_frame(self):
         t = time.time()
         # print(cam.pose)
-        rays = gen_rays(
-            torch.cuda.FloatTensor(self.cam.pose), 
-            self.cam_dirs,
-            self.W, self.H
-        )
-        rgb, _, depth, n_rendering_samples = render_image_test(
-            self.max_samples,
-            self.radiance_field,
-            self.estimator,
-            rays,
-            # rendering options
-            near_plane=self.near_plane,
-            render_step_size=self.render_step_size,
-            render_bkgd=self.render_bkgd,
-            cone_angle=self.cone_angle,
-            alpha_thre=self.alpha_thre,
-            # dnerf
-            timestamps=self.timestamps,
-        )
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            rays = gen_rays(
+                torch.cuda.FloatTensor(self.cam.pose), 
+                self.cam_dirs,
+                self.W, self.H
+            )
+            rgb, _, depth, n_rendering_samples = render_image_test(
+                self.max_samples,
+                self.radiance_field,
+                self.estimator,
+                rays,
+                # rendering options
+                near_plane=self.near_plane,
+                render_step_size=self.render_step_size,
+                render_bkgd=self.render_bkgd,
+                cone_angle=self.cone_angle,
+                alpha_thre=self.alpha_thre,
+                # dnerf
+                timestamps=self.timestamps,
+            )
 
         depth = depth.squeeze(-1)
         self.dt = time.time()-t

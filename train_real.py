@@ -74,7 +74,7 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     from datasets.dnerf_synthetic import SubjectLoader
     # training parameters
     max_steps = 20000
-    init_batch_size = 8192
+    init_batch_size = 1024
     target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # weight_decay = (
@@ -88,8 +88,8 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     train_dataset_kwargs = {}
     test_dataset_kwargs = {}
     # model parameters
-    moving_step = 1/2048
-    hash_dst_resolution = 2048
+    moving_step = 3/4096
+    hash_dst_resolution = 4096
     grid_resolution = 128
     grid_nlvl = 1
     # render parameters
@@ -147,9 +147,10 @@ else:
     near_plane = 0.2
     far_plane = 1.0e10
     # dataset parameters
-    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 2}
-    test_dataset_kwargs = {"factor": 2}
+    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
+    test_dataset_kwargs = {"color_bkgd_aug": "black", "factor": 4}
     # model parameters
+    moving_step = 1/4096
     hash_dst_resolution = 4096
     grid_resolution = 128
     grid_nlvl = 4
@@ -206,7 +207,8 @@ elif args.scene in DYNERF_SCENES:
     estimator.mark_invisible_cells(
         mark_invisible_K.clone().to(device), 
         train_dataset.camtoworlds.clone().to(device), 
-        [train_dataset.width, train_dataset.height],
+        train_dataset.width, 
+        train_dataset.height,
         near_plane,
     )
 else:
@@ -278,80 +280,89 @@ for step in range(max_steps + 1):
         density = radiance_field.query_density(x, t)['density']
         return density * render_step_size
     
-    # with torch.autocast(device_type='cuda', dtype=torch.float16):
-    # update occupancy grid
-    estimator.update_every_n_steps(
-        step=step,
-        occ_eval_fn=occ_eval_fn,
-        occ_thre=1e-2,
-    )
+    with torch.autocast(device_type='cuda', dtype=torch.float16):
+        # update occupancy grid
+        estimator.update_every_n_steps(
+            step=step,
+            occ_eval_fn=occ_eval_fn,
+            occ_thre=1e-2,
+        )
 
-    # render
-    rgb, acc, depth, n_rendering_samples, extra = render_image(
-        radiance_field,
-        estimator,
-        rays,
-        # rendering options
-        near_plane=near_plane,
-        render_step_size=render_step_size,
-        render_bkgd=render_bkgd,
-        cone_angle=cone_angle,
-        alpha_thre=alpha_thre,
-        timestamps=timestamps,
-    )
-    if n_rendering_samples == 0:
-        continue
+        # render
+        rgb, acc, depth, n_rendering_samples, extra = render_image(
+            radiance_field,
+            estimator,
+            rays,
+            # rendering options
+            near_plane=near_plane,
+            render_step_size=render_step_size,
+            render_bkgd=render_bkgd,
+            cone_angle=cone_angle,
+            alpha_thre=alpha_thre,
+            timestamps=timestamps,
+        )
+        if n_rendering_samples == 0:
+            continue
 
-    # if target_sample_batch_size > 0:
-    #     # dynamic batch size for rays to keep sample batch size constant.
-    #     num_rays = len(pixels)
-    #     num_rays = int(
-    #         num_rays * (target_sample_batch_size / float(n_rendering_samples))
-    #     )
-    #     train_dataset.update_num_rays(num_rays)
+        if target_sample_batch_size > 0:
+            # dynamic batch size for rays to keep sample batch size constant.
+            num_rays = len(pixels)
+            num_rays = int(
+                num_rays * (target_sample_batch_size / float(n_rendering_samples))
+            )
+            train_dataset.update_num_rays(num_rays)
 
-    # compute loss
-    loss = F.huber_loss(rgb, pixels)
+        # if args.scene in DNERF_SYNTHETIC_SCENES:
+        # alive_ray_mask = acc.squeeze(-1) > 0
+        # rgb = rgb[alive_ray_mask]
+        # pixels = pixels[alive_ray_mask]
+        # acc = acc[alive_ray_mask]
 
-    # loss += (-acc*torch.log(acc)).mean()*1e-4
+        # compute loss
+        loss = F.huber_loss(rgb, pixels)
 
-    for interal_data in extra:
-    
-        if args.distortion_loss:
-            loss += distortion(
-                interal_data['ray_indices'], 
-                interal_data['weights'], 
-                interal_data['t_starts'], 
-                interal_data['t_ends']
-            ) * 1e-3
+        # loss += (-acc*torch.log(acc)).mean()*1e-2
 
-        if args.acc_entorpy_loss:
-            T_last = 1 - acc
-            T_last = T_last.clamp(1e-6, 1-1e-6)
-            entropy_loss = -(T_last*torch.log(T_last) + (1-T_last)*torch.log(1-T_last)).mean()
-            loss += entropy_loss*1e-3
+        for interal_data in extra:
+        
+            if args.distortion_loss:
+                loss += distortion(
+                    interal_data['ray_indices'], 
+                    interal_data['weights'], 
+                    interal_data['t_starts'], 
+                    interal_data['t_ends']
+                ) * 1e-3
 
-        if args.weight_rgbper:
-            rgbper = (interal_data['rgbs'] - pixels[interal_data['ray_indices']]).pow(2).sum(dim=-1)
-            loss += (rgbper * interal_data['weights'].detach()).sum() / pixels.shape[0] * 1e-3
+            if args.acc_entorpy_loss:
+                T_last = 1 - acc
+                T_last = T_last.clamp(1e-6, 1-1e-6)
+                entropy_loss = -(T_last*torch.log(T_last) + (1-T_last)*torch.log(1-T_last)).mean()
+                loss += entropy_loss*1e-3
 
-        if args.use_feat_predict:
-            loss += interal_data['latent_losses'].mean()
+            if args.weight_rgbper:
+                rgbper = (interal_data['rgbs'] - pixels[interal_data['ray_indices']]).pow(2).sum(dim=-1)
+                loss += (rgbper * interal_data['weights'].detach()).sum() / pixels.shape[0] * 1e-3
 
-        if args.use_weight_predict:
-            loss += interal_data['weight_losses'].mean()
+            if args.use_feat_predict:
+                # if args.scene in DNERF_SYNTHETIC_SCENES:
+                    # loss += interal_data['latent_losses'][alive_ray_mask].mean()
+                # else:
+                    loss += interal_data['latent_losses'].mean()
+
+            if args.use_weight_predict:
+                loss += interal_data['weight_losses'].mean()
 
     
     optimizer.zero_grad()
     # do not unscale it because we are using Adam.
     grad_scaler.scale(loss).backward()
-    optimizer.step()
-    scheduler.step()
-    # grad_scaler.step(optimizer)
-    # scale = grad_scaler.get_scale()
-    # grad_scaler.update()
-    # if not scale > grad_scaler.get_scale():
-    #     scheduler.step()
+    # optimizer.step()
+    # scheduler.step()
+    grad_scaler.step(optimizer)
+    scale = grad_scaler.get_scale()
+    grad_scaler.update()
+    if not scale > grad_scaler.get_scale():
+        scheduler.step()
 
     if step % 10000 == 0:
         elapsed_time = time.time() - tic
@@ -391,20 +402,7 @@ for step in range(max_steps + 1):
                     timestamps = data["timestamps"].to(device)
 
                 # rendering
-                rgb, acc, depth, n_rendering_samples, extra = render_image(
-                    radiance_field,
-                    estimator,
-                    rays,
-                    # rendering options
-                    near_plane=near_plane,
-                    render_step_size=render_step_size,
-                    render_bkgd=render_bkgd,
-                    cone_angle=cone_angle,
-                    alpha_thre=alpha_thre,
-                    timestamps=timestamps,
-                )
-                # rgb, acc, depth, _ = render_image_test(
-                #     1024,
+                # rgb, acc, depth, n_rendering_samples, extra = render_image(
                 #     radiance_field,
                 #     estimator,
                 #     rays,
@@ -416,6 +414,19 @@ for step in range(max_steps + 1):
                 #     alpha_thre=alpha_thre,
                 #     timestamps=timestamps,
                 # )
+                rgb, acc, depth, _ = render_image_test(
+                    1024,
+                    radiance_field,
+                    estimator,
+                    rays,
+                    # rendering options
+                    near_plane=near_plane,
+                    render_step_size=render_step_size,
+                    render_bkgd=render_bkgd,
+                    cone_angle=cone_angle,
+                    alpha_thre=alpha_thre,
+                    timestamps=timestamps,
+                )
                 mse = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(mse) / np.log(10.0)
                 psnrs.append(psnr.item())

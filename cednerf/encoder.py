@@ -56,6 +56,9 @@ class SinusoidalEncoderWithExp(nn.Module):
         self.register_buffer(
             "scales", torch.tensor([2**i for i in range(min_deg, max_deg)])
         )
+        self.register_buffer(
+            "scales_move", torch.tensor([i*2**i for i in range(min_deg, max_deg)])
+        )
 
     @property
     def latent_dim(self) -> int:
@@ -77,10 +80,10 @@ class SinusoidalEncoderWithExp(nn.Module):
             list(x.shape[:-1]) + [(self.max_deg - self.min_deg), self.x_dim],
         )
         x_var_b = torch.reshape(
-            (x_var[Ellipsis, None, :] * self.scales[:, None]),
+            (x_var[Ellipsis, None, :] * self.scales_move[:, None]),
             list(x_var.shape[:-1]) + [(self.max_deg - self.min_deg)],
         )
-        latent = torch.sin(torch.cat([xb, xb + 0.5 * math.pi], dim=-1)) * torch.exp(-6e1 * x_var_b)[..., None]
+        latent = torch.sin(torch.cat([xb, xb + 0.5 * math.pi], dim=-1)) * torch.exp(-1 * x_var_b)[..., None]
         latent = torch.reshape(latent, list(x.shape[:-1]) + [(self.max_deg - self.min_deg) * self.x_dim * 2])
         if self.use_identity:
             latent = torch.cat([x] + [latent], dim=-1)
