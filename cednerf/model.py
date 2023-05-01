@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .utils import trunc_exp
 from .encoder import SinusoidalEncoderWithExp, SinusoidalEncoder
+from .taichi_kernel.triplane import TriPlaneEncoder
 
 try:
     import tinycudann as tcnn
@@ -167,6 +168,7 @@ class DNGPradianceField(torch.nn.Module):
                 "per_level_scale": per_level_scale,
             },
         )
+        # self.hash_encoder = TriPlaneEncoder()
 
         input_dim4base = self.hash_encoder.n_output_dims
         self.geo_feat_dim_head = self.geo_feat_dim

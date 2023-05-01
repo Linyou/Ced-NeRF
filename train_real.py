@@ -376,7 +376,6 @@ for step in range(max_steps + 1):
         )
 
     if step > 0 and step % max_steps == 0:
-        torch.cuda.empty_cache()
         # evaluation
         radiance_field.eval()
         estimator.eval()

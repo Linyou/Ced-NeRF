@@ -10,10 +10,14 @@ from typing import Optional
 from datasets.utils import Rays, namedtuple_map
 
 from nerfacc.estimators.occ_grid import OccGridEstimator
-from nerfacc import traverse_grids, ray_aabb_intersect
+from nerfacc import (
+    traverse_grids, 
+    ray_aabb_intersect, 
+    render_weight_from_density,
+)
+from nerfacc.volrend import accumulate_along_rays_
 
-from .render import rendering, render_weight_from_density_prefix, accumulate_along_rays
-from .taichi_kernel import composite_test
+from .render import rendering, render_weight_from_density_prefix
 
 def set_random_seed(seed):
     random.seed(seed)
@@ -196,7 +200,7 @@ def render_image_test(
     depth = torch.zeros(N_rays, 1, device=device)
     rgb = torch.zeros(N_rays, 3, device=device)
 
-    ray_mask_id = torch.arange(N_rays, device=device)
+    ray_mask = torch.ones(N_rays, device=device).bool()
 
     min_samples = 1 if cone_angle==0 else 4
 
@@ -220,9 +224,11 @@ def render_image_test(
             0, n_grids * 2, device=t_mins.device, dtype=torch.int64
         ).expand(N_rays, n_grids * 2)
 
+    opc_thres = 1 - early_stop_eps
+
     while iter_samples < max_samples:
 
-        N_alive = len(ray_mask_id)
+        N_alive = ray_mask.sum().item()
         if N_alive==0: break
 
         # the number of samples to add on each ray
@@ -249,7 +255,8 @@ def render_image_test(
             render_step_size,
             cone_angle,
             N_samples,
-            ray_mask_id, 
+            True,
+            ray_mask, 
             # pre-compute intersections
             t_sorted,  # [n_rays, m*2]
             t_indices,  # [n_rays, m*2]
@@ -257,59 +264,46 @@ def render_image_test(
         )
         t_starts = intervals.vals[intervals.is_left]
         t_ends = intervals.vals[intervals.is_right]
-        ray_indices_local = intervals.ray_indices[intervals.is_right]
         ray_indices = samples.ray_indices[samples.is_valid]
         packed_info = samples.packed_info
 
         # get rgb and sigma from radiance field
         rgbs, sigmas = rgb_sigma_fn(t_starts, t_ends, ray_indices)
-         # volume rendering
+        # volume rendering
         # native cuda scan
-        weights, _, _ = render_weight_from_density_prefix(
+        weights, _, _ = render_weight_from_density(
             t_starts,
             t_ends,
             sigmas,
-            ray_indices=ray_indices_local,
-            n_rays=N_alive,
+            ray_indices=ray_indices,
+            n_rays=N_rays,
             prefix_trans=1 - opacity[ray_indices].squeeze(-1),
         )
-        rgb[ray_mask_id] += accumulate_along_rays(
-            weights, values=rgbs, ray_indices=ray_indices_local, n_rays=N_alive
-        )
-        opacity[ray_mask_id] += accumulate_along_rays(
-            weights, values=None, ray_indices=ray_indices_local, n_rays=N_alive
-        )
-        depth[ray_mask_id] += accumulate_along_rays(
+        accumulate_along_rays_(
             weights,
-            values=(t_starts + t_ends)[..., None] / 2.0,
-            ray_indices=ray_indices_local,
-            n_rays=N_alive,
+            values=rgbs, 
+            ray_indices=ray_indices, 
+            outputs=rgb,
         )
-        # debug_str += f"t_min[{ray_mask_id[0]}]: {near_planes[ray_mask_id[0]]} | "
-        # taichi kernel 
-        # composite_test(
-        #     # input args
-        #     sigmas.contiguous(), 
-        #     rgbs.contiguous(), 
-        #     t_starts.contiguous(),
-        #     t_ends.contiguous(), 
-        #     packed_info.contiguous(), 
-        #     ray_mask_id.contiguous(), 
-        #     early_stop_eps, 
-        #     alpha_thre,
-        #     # output args
-        #     opacity.contiguous(), 
-        #     depth.contiguous(), 
-        #     rgb.contiguous()
-        # )
+        accumulate_along_rays_(
+            weights,
+            values=None, 
+            ray_indices=ray_indices, 
+            outputs=opacity,
+        )
+        accumulate_along_rays_(
+            weights,
+            values=None, 
+            ray_indices=ray_indices, 
+            outputs=depth,
+        )
         # update near_planes using termination planes
-        near_planes[ray_mask_id] = termination_planes
+        near_planes = termination_planes
         # update rays status
-        mask = torch.logical_or(
-            opacity[ray_mask_id, 0] > (1 - early_stop_eps) ,
-            packed_info[:, 1] == 0
+        ray_mask = torch.logical_and(
+            opacity.view(-1) <= opc_thres,
+            packed_info[:, 1] == N_samples,
         )
-        ray_mask_id = ray_mask_id[~mask]
         total_samples += ray_indices.shape[0]
         # print(debug_str)
     
