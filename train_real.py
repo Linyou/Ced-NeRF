@@ -67,6 +67,8 @@ parser = get_model_args(parser)
 
 args = parser.parse_args()
 
+print(args.data_root)
+
 device = "cuda:0"
 set_random_seed(42)
 
@@ -192,7 +194,7 @@ estimator = OccGridEstimator(
 
 if args.scene in HYPERNERF_SCENES:
     idx = torch.randint(0, len(train_dataset.K), (1,)).item()
-    mark_invisible_K = train_dataset.K[idx]
+    mark_invisible_K = train_dataset.K
     estimator.mark_invisible_cells(
         mark_invisible_K, 
         train_dataset.camtoworlds, 
@@ -205,7 +207,7 @@ elif args.scene in DYNERF_SCENES:
     estimator = estimator.to(device)
     mark_invisible_K = train_dataset.K
     estimator.mark_invisible_cells(
-        mark_invisible_K.clone().to(device), 
+        mark_invisible_K.unsqueeze(0).clone().to(device), 
         train_dataset.camtoworlds.clone().to(device), 
         train_dataset.width, 
         train_dataset.height,
