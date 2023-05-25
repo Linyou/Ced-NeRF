@@ -293,7 +293,7 @@ def render_image_test(
         )
         accumulate_along_rays_(
             weights,
-            values=None, 
+            values=(t_starts + t_ends)[..., None] / 2.0, 
             ray_indices=ray_indices, 
             outputs=depth,
         )

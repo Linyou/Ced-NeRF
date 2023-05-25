@@ -70,6 +70,18 @@ def get_model_args(parser):
         help="use accumulated opacites as entropy loss",
     )
 
+    parser.add_argument(
+        '--render_video',
+        action="store_true",
+        help="render video",
+    )
+
+    parser.add_argument(
+        '--load_model',
+        action="store_true",
+        help="load model",
+    )
+
 
 
     return parser

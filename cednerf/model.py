@@ -64,16 +64,16 @@ class DNGPradianceField(torch.nn.Module):
         )  # 1.4472692012786865
         # per_level_scale = 1.4472692012786865
 
-        print('--DNGPradianceField configuration--')
-        print(f'  moving_step: {moving_step}')
-        print(f'  hash b: {per_level_scale:6f}')
-        print(f'  use_div_offsets: {use_div_offsets}')
-        print(f'  use_feat_predict: {use_feat_predict}')
-        print(f'  use_weight_predict: {use_weight_predict}')
-        print(f'  use_time_embedding: {use_time_embedding}')
-        print(f'  use_time_attenuation: {use_time_attenuation}')
-        print(f'  time_inject_before_sigma: {time_inject_before_sigma}')
-        print('-----------------------------------')
+        # print('--DNGPradianceField configuration--')
+        # print(f'  moving_step: {moving_step}')
+        # print(f'  hash b: {per_level_scale:6f}')
+        # print(f'  use_div_offsets: {use_div_offsets}')
+        # print(f'  use_feat_predict: {use_feat_predict}')
+        # print(f'  use_weight_predict: {use_weight_predict}')
+        # print(f'  use_time_embedding: {use_time_embedding}')
+        # print(f'  use_time_attenuation: {use_time_attenuation}')
+        # print(f'  time_inject_before_sigma: {time_inject_before_sigma}')
+        # print('-----------------------------------')
 
         self.use_feat_predict = use_feat_predict
         self.use_weight_predict = use_weight_predict
@@ -96,14 +96,26 @@ class DNGPradianceField(torch.nn.Module):
             self.xyz_wrap = tcnn.NetworkWithInputEncoding(
                 n_input_dims=self.motion_input_dim,
                 encoding_config={
-                    "otype": "HashGrid",
-                    "n_levels": 4,
-                    "n_features_per_level": 2,
-                    "log2_hashmap_size": log2_hashmap_size,
-                    "base_resolution": 8,
-                    "per_level_scale":  math.exp(
-                        math.log(64 / 8) / (4 - 1)
-                    )  # 1.4472692012786865,
+                    "otype": "Composite",
+                    "nested": [
+                        {
+                            "n_dims_to_encode": 3,
+                            "otype": "HashGrid",
+                            "n_levels": 8,
+                            "n_features_per_level": 2,
+                            "log2_hashmap_size": 19,
+                            "base_resolution": 16,
+                            "per_level_scale":  math.exp(
+                                math.log(2048 / 16) / (8 - 1)
+                            ),
+                        },
+                        {
+                            "n_dims_to_encode": 1,
+                            "otype": "Frequency",
+                            "n_frequencies": 4
+                        },
+                        # {"otype": "Identity", "n_bins": 4, "degree": 4},
+                    ],
                 },
                 n_output_dims=self.motion_output_dim,
                 network_config={
@@ -134,7 +146,7 @@ class DNGPradianceField(torch.nn.Module):
                     "activation": "ReLU",
                     "output_activation": "None",
                     "n_neurons": 64,
-                    "n_hidden_layers": 2,
+                    "n_hidden_layers": 4,
                 },
             )
 
@@ -148,13 +160,12 @@ class DNGPradianceField(torch.nn.Module):
                         {
                             "n_dims_to_encode": 3,
                             "otype": "SphericalHarmonics",
-                            "degree": 4,
+                            "degree": 2,
                         },
                         # {"otype": "Identity", "n_bins": 4, "degree": 4},
                     ],
                 },
             )
-
 
 
         self.hash_encoder = tcnn.Encoding(
@@ -175,7 +186,7 @@ class DNGPradianceField(torch.nn.Module):
 
         if self.use_time_embedding:
             self.time_encoder = SinusoidalEncoder(1, 0, 4, True)
-            self.time_encoder_feat = SinusoidalEncoderWithExp(1, 0, 6, True)
+            self.time_encoder_feat = SinusoidalEncoderWithExp(1, 0, 4, True)
 
             if self.use_time_attenuation:
                 if self.time_inject_before_sigma:
@@ -225,7 +236,7 @@ class DNGPradianceField(torch.nn.Module):
                 n_input_dims=num_dim+1,
                 encoding_config={
                     "otype": "Frequency",
-                    "n_frequencies": 3
+                    "n_frequencies": 4
                 },
                 n_output_dims=self.hash_encoder.n_output_dims,
                 network_config={
@@ -242,7 +253,7 @@ class DNGPradianceField(torch.nn.Module):
                 n_input_dims=num_dim+1,
                 encoding_config={
                     "otype": "Frequency",
-                    "n_frequencies": 3
+                    "n_frequencies": 4
                 },
                 n_output_dims=1,
                 network_config={
@@ -266,7 +277,7 @@ class DNGPradianceField(torch.nn.Module):
         offsets = self.xyz_wrap(torch.cat([x, t], dim=-1))
         if self.use_div_offsets:
             grid_move = offsets[:, 0:3]*self.MOVING_STEP
-            fine_move = (torch.special.expit(offsets[:, 3:])*2 - 1)*self.MOVING_STEP
+            fine_move = F.tanh(offsets[:, 3:])*self.MOVING_STEP
         else:
             grid_move = offsets*self.MOVING_STEP
             fine_move = 0

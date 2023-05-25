@@ -363,8 +363,8 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.principal_point_x = self.WIDTH / 2.
         self.principal_point_y = self.HEIGHT / 2.
 
-        print("showing a pose: ")
-        print(self.poses[0].astype(np.float16))
+        # print("showing a pose: ")
+        # print(self.poses[0].astype(np.float16))
         # print("showing timestamps: ")
         # print(self.timestamps)
         # print("focal_x: ", self.focal_x)
@@ -372,7 +372,8 @@ class SubjectLoader(torch.utils.data.Dataset):
         # print("height: ", self.HEIGHT)
         # print("width: ", self.WIDTH)
         Ks = []
-        for f in tqdm(self.focals):
+        # for f in tqdm(self.focals):
+        for f in self.focals:
             temp_K = torch.eye(3)
             temp_K[0, 0] = f[0].item()
             temp_K[1, 1] = f[1].item()
@@ -393,7 +394,7 @@ class SubjectLoader(torch.utils.data.Dataset):
             assert self.images.shape[1:3] == (self.HEIGHT, self.WIDTH)
 
         self.width, self.height = self.WIDTH, self.HEIGHT
-        print(f"image width: {self.width}, height: {self.height}")
+        # print(f"image width: {self.width}, height: {self.height}")
 
     def __len__(self):
         return len(self.images)

@@ -6,9 +6,74 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from tqdm import tqdm
-from .utils import Rays
-from .pose_ulils import correct_poses_bounds
+from tqdm import tqdm, trange
+from .utils import Rays, generate_spiral_path
+from .pose_ulils import correct_poses_bounds, create_spiral_poses
+
+@torch.no_grad()
+def dynerf_isg_weight(imgs, median_imgs, gamma):
+    # imgs is [num_cameras * num_frames, h, w, 3]
+    # median_imgs is [num_cameras, h, w, 3]
+    assert imgs.dtype == torch.uint8
+    assert median_imgs.dtype == torch.uint8
+    num_cameras, h, w, c = median_imgs.shape
+    squarediff = (
+        imgs.view(num_cameras, -1, h, w, c)
+            .float()  # creates new tensor, so later operations can be in-place
+            .div_(255.0)
+            .sub_(
+                median_imgs[:, None, ...].float().div_(255.0)
+            )
+            .square_()  # noqa
+    )  # [num_cameras, num_frames, h, w, 3]
+    # differences = median_imgs[:, None, ...] - imgs.view(num_cameras, -1, h, w, c)  # [num_cameras, num_frames, h, w, 3]
+    # squarediff = torch.square_(differences)
+    psidiff = squarediff.div_(squarediff + gamma**2)
+    psidiff = (1./3) * torch.sum(psidiff, dim=-1)  # [num_cameras, num_frames, h, w]
+    return psidiff  # valid probabilities, each in [0, 1]
+
+
+@torch.no_grad()
+def dynerf_ist_weight(imgs, num_cameras, alpha=0.1, frame_shift=25):  # DyNerf uses alpha=0.1
+    assert imgs.dtype == torch.uint8
+    N, h, w, c = imgs.shape
+    frames = imgs.view(num_cameras, -1, h, w, c).float()  # [num_cameras, num_timesteps, h, w, 3]
+    max_diff = None
+    shifts = list(range(frame_shift + 1))[1:]
+    for shift in shifts:
+        shift_left = torch.cat([frames[:, shift:, ...], torch.zeros(num_cameras, shift, h, w, c)], dim=1)
+        shift_right = torch.cat([torch.zeros(num_cameras, shift, h, w, c), frames[:, :-shift, ...]], dim=1)
+        mymax = torch.maximum(torch.abs_(shift_left - frames), torch.abs_(shift_right - frames))
+        if max_diff is None:
+            max_diff = mymax
+        else:
+            max_diff = torch.maximum(max_diff, mymax)  # [num_timesteps, h, w, 3]
+        
+    max_diff = torch.mean(max_diff, dim=-1)  # [num_timesteps, h, w]
+    max_diff = max_diff.clamp_(min=alpha)
+    return max_diff
+
+@torch.no_grad()
+def dynerf_ist_weight_nice(imgs, num_cameras, alpha=0.1, frame_shift=25):
+    assert imgs.dtype == torch.uint8
+    N, h, w, c = imgs.shape
+    frames = imgs.view(num_cameras, -1, h, w, c).float()
+    max_diff_list = []
+
+    shifts = list(range(frame_shift + 1))[1:]
+    print("loop over cameras")
+    for cam_id in trange(num_cameras):
+        max_diff_cam = torch.zeros(N//num_cameras, h, w, c)
+        for shift in shifts:
+            shift_left = torch.cat([frames[cam_id, shift:, ...], torch.zeros(shift, h, w, c)], dim=0)
+            shift_right = torch.cat([torch.zeros(shift, h, w, c), frames[cam_id, :-shift, ...]], dim=0)
+            mymax = torch.maximum(torch.abs_(shift_left - frames[cam_id]), torch.abs_(shift_right - frames[cam_id]))
+            max_diff_cam = torch.maximum(max_diff_cam, mymax)
+            del mymax, shift_left, shift_right
+            torch.cuda.empty_cache()
+        max_diff_list.append(torch.mean(max_diff_cam, dim=-1).clamp_(min=alpha))
+    max_diff = torch.stack(max_diff_list)
+    return max_diff
 
 def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=True):
 
@@ -50,15 +115,29 @@ def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=
     WIDTH = int(poses[0, 1, -1])
 
     poses, poses_ref, bds = correct_poses_bounds(poses, bds)
+    # print("bds: ", bds)
+    render_poses = generate_spiral_path(
+        poses[:, :3, :4], 
+        bds, 
+        n_frames=300,
+        n_rots=2, 
+        zrate=0.1, 
+        dt=0.7, 
+        percentile=50,
+    )
+
 
     print("poses shape: ", poses.shape)
 
     poses[:, :, 1:3] *= -1
+    render_poses[:, :, 1:3] *= -1
     # scale
     pose_radius_scale = 0.4
     poses[:, :, 3] *= pose_radius_scale
+    render_poses[:, :, 3] *= pose_radius_scale
     # offset
     poses[:, :, 3] += np.array([[0,0,1.5]])
+    render_poses[:, :, 3] += np.array([[0,0,1.5]])
 
     if split == 'train':
         load_every = 1
@@ -90,6 +169,7 @@ def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=
             sizeofimage = len(vids)-1 # 0~n-1
             progress.set_description_str(f'{scene}-{v_name}')
             progress.reset(total=len(vids))
+            images_per_cam = []
             for j, im in enumerate(vids):
                 progress.update()
                 if j % load_every == 0:
@@ -97,13 +177,14 @@ def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=
                     # images.append(np.array(Image.open(im['path'])).astype(np.uint8)[None, ...])
                     if read_img:
                         img_path = os.path.join(basedir, im['path'])
-                        images.append(imageio.imread(img_path).astype(np.uint8))
+                        images_per_cam.append(imageio.imread(img_path).astype(np.uint8))
                     else:
-                        images.append(np.array([0,]))
+                        images_per_cam.append(np.array([0,]))
                     timestamps.append(idx/sizeofimage)
                     # timestamps.append(0.)
                     poses_list.append(pose)
                     # bds_list.append(bd)
+            images += images_per_cam
             progress.refresh()
 
     images = torch.from_numpy(np.stack(images, axis=0))
@@ -111,7 +192,7 @@ def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=
     timestamps = np.array(timestamps).astype(np.float32)
     # bds_list = np.array(bds_list).astype(np.float32)
         
-    return images, poses_list, timestamps, bds_list, sizeofimage+1, len(video_list), (focal, HEIGHT, WIDTH)
+    return images, poses_list, timestamps, bds_list, sizeofimage+1, len(video_list), (focal, HEIGHT, WIDTH), render_poses
 
 
 class SubjectLoader(torch.utils.data.Dataset):
@@ -165,8 +246,10 @@ class SubjectLoader(torch.utils.data.Dataset):
             self.bounds,
             self.images_per_video,
             self.num_cameras,
-            instrinc
+            instrinc,
+            render_poses,
         ) = _load_data_from_json(root_fp, subject_id, factor=factor, split=split, read_img=read_image)
+
 
         self.focal, self.HEIGHT, self.WIDTH = instrinc
 
@@ -175,6 +258,10 @@ class SubjectLoader(torch.utils.data.Dataset):
         self.timestamps = torch.from_numpy(self.timestamps).to(torch.float32)[
             :, None
         ]
+        self.render_poses = torch.from_numpy(render_poses).to(torch.float32)
+
+        print("render_poses: ", self.render_poses.shape)
+        print(self.render_poses[0])
         
 
         print("showing a pose: ")
@@ -193,15 +280,16 @@ class SubjectLoader(torch.utils.data.Dataset):
             assert self.images.shape[1:3] == (self.HEIGHT, self.WIDTH)
 
         self.width, self.height = self.WIDTH, self.HEIGHT
-
+        
     def __len__(self):
-        return len(self.images)
+        return len(self.camtoworlds)
 
     def to(self, device):
         self.K = self.K.to(device)
         self.images = self.images.to(device)
         self.camtoworlds = self.camtoworlds.to(device)
         self.timestamps = self.timestamps.to(device)
+        self.render_poses = self.render_poses.to(device)
         return self
 
     @torch.no_grad()
@@ -209,6 +297,51 @@ class SubjectLoader(torch.utils.data.Dataset):
         data = self.fetch_data(index)
         data = self.preprocess(data)
         return data
+    
+    def get_render_poses(self, index):
+        image_id = [index]
+        x, y = torch.meshgrid(
+            torch.arange(self.WIDTH, device=self.images.device),
+            torch.arange(self.HEIGHT, device=self.images.device),
+            indexing="xy",
+        )
+        x = x.flatten()
+        y = y.flatten()
+
+        # generate rays
+        c2w = self.render_poses[image_id]  # (num_rays, 3, 4)
+        camera_dirs = F.pad(
+            torch.stack(
+                [
+                    (x - self.K[0, 2] + 0.5) / self.K[0, 0],
+                    (y - self.K[1, 2] + 0.5) / self.K[1, 1]
+                    * (-1.0 if self.OPENGL_CAMERA else 1.0),
+                ],
+                dim=-1,
+            ),
+            (0, 1),
+            value=(-1.0 if self.OPENGL_CAMERA else 1.0),
+        )  # [num_rays, 3]
+
+        # [n_cams, height, width, 3]
+        directions = (camera_dirs[:, None, :] * c2w[:, :3, :3]).sum(dim=-1)
+        origins = torch.broadcast_to(c2w[:, :3, -1], directions.shape)
+        viewdirs = directions / torch.linalg.norm(
+            directions, dim=-1, keepdims=True
+        )
+        origins = torch.reshape(origins, (self.HEIGHT, self.WIDTH, 3))
+        viewdirs = torch.reshape(viewdirs, (self.HEIGHT, self.WIDTH, 3))
+        directions = torch.reshape(directions, (self.HEIGHT, self.WIDTH, 3))
+        rays = Rays(
+            origins=origins, 
+            viewdirs=viewdirs
+        )
+        timestamps = torch.tensor([[index/self.render_poses.shape[0]]])
+
+        return {
+            "rays": rays,  # [h, w, 3] or [num_rays, 3]
+            "timestamps": timestamps,  # [num_rays, 1]
+        }
 
     def preprocess(self, data):
         """Process the fetched / cached data with randomness."""
@@ -244,12 +377,12 @@ class SubjectLoader(torch.utils.data.Dataset):
 
         if self.training:
             if self.batch_over_images:
-                # image_id = torch.randint(
-                #     0,
-                #     len(self.images),
-                #     size=(num_rays,),
-                #     device=self.images.device,
-                # )
+                image_id = torch.randint(
+                    0,
+                    len(self.images),
+                    size=(num_rays,),
+                    device=self.images.device,
+                )
                 t_idx = torch.randint(
                     0,
                     self.images_per_video,
@@ -263,6 +396,7 @@ class SubjectLoader(torch.utils.data.Dataset):
                     device=self.images.device,
                 )
                 image_id = cam_id * self.images_per_video + t_idx
+
             else:
                 image_id = [index]
             x = torch.randint(
@@ -271,6 +405,7 @@ class SubjectLoader(torch.utils.data.Dataset):
             y = torch.randint(
                 0, self.HEIGHT, size=(num_rays,), device=self.images.device
             )
+            
         else:
             image_id = [index]
             x, y = torch.meshgrid(

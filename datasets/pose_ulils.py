@@ -165,7 +165,7 @@ def create_spiral_poses(poses, rads, focal, N=120, flip=False):
     rots = 2
 
     render_poses = []
-    rads = np.array(list(rads) + [1.])
+    rads += np.array(list(rads) + [1.])
 
     for theta in np.linspace(0., 2. * np.pi * rots, N+1)[:-1]:
         c = np.dot(c2w[:3,:4], np.array(

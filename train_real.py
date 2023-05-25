@@ -15,6 +15,8 @@ import tqdm
 from gui import GUI
 from cednerf.model import DNGPradianceField
 from cednerf.losses import distortion
+from pytorch_msssim import ms_ssim
+
 
 from cednerf.utils import (
     render_image,
@@ -23,7 +25,7 @@ from cednerf.utils import (
 )
 
 from nerfacc.estimators.occ_grid import OccGridEstimator
-
+import itertools
 from datasets import (
     DNERF_SYNTHETIC_SCENES,
     DYNERF_SCENES,
@@ -32,6 +34,13 @@ from datasets import (
 from datasets.utils import namedtuple_map
 
 from opt import get_model_args
+import cv2
+def depth2img(depth):
+    depth = (depth-depth.min())/(depth.max()-depth.min())
+    depth_img = cv2.applyColorMap((depth*255).cpu().numpy().astype(np.uint8),
+                                  cv2.COLORMAP_TURBO)
+
+    return depth_img
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -90,8 +99,8 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
     train_dataset_kwargs = {}
     test_dataset_kwargs = {}
     # model parameters
-    moving_step = 3/4096
-    hash_dst_resolution = 4096
+    moving_step = 0.0001
+    hash_dst_resolution = 1024
     grid_resolution = 128
     grid_nlvl = 1
     # render parameters
@@ -119,9 +128,10 @@ elif args.scene in HYPERNERF_SCENES:
     far_plane = 1.0e10
     # dataset parameters
     add_cam = True if 'vrig' in args.scene else False
-    train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 2, "add_cam": add_cam}
-    test_dataset_kwargs = {"factor": 2, "add_cam": add_cam}
+    train_dataset_kwargs = {"color_bkgd_aug": "black", "factor": 2, "add_cam": add_cam}
+    test_dataset_kwargs = {"color_bkgd_aug": "black", "factor": 2, "add_cam": add_cam}
     # model parameters
+    moving_step = 1/4096
     hash_dst_resolution = 4096
     grid_resolution = 128
     grid_nlvl = 2
@@ -141,7 +151,7 @@ else:
 
     # training parameters
     max_steps = 20000
-    init_batch_size = 1024
+    init_batch_size = 8192
     target_sample_batch_size = 1 << 18
     weight_decay = 0.0
     # scene parameters
@@ -155,7 +165,7 @@ else:
     moving_step = 1/4096
     hash_dst_resolution = 4096
     grid_resolution = 128
-    grid_nlvl = 4
+    grid_nlvl = 5
     # render parameters
     render_step_size = 1e-3
     alpha_thre = 1e-2
@@ -168,14 +178,46 @@ else:
     ]
 
 
-train_dataset = SubjectLoader(
-    subject_id=args.scene,
-    root_fp=args.data_root,
-    split=args.train_split,
-    num_rays=init_batch_size,
-    **train_dataset_kwargs,
+estimator = OccGridEstimator(
+    roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl,
 )
 
+if args.load_model:
+    max_steps = -1
+else:
+    train_dataset = SubjectLoader(
+        subject_id=args.scene,
+        root_fp=args.data_root,
+        split=args.train_split,
+        num_rays=init_batch_size,
+        **train_dataset_kwargs,
+    )
+    if args.scene in DNERF_SYNTHETIC_SCENES:
+        train_dataset = train_dataset.to(device)
+
+    if args.scene in DYNERF_SCENES and args.gui:
+        estimator = estimator.to(device)
+        mark_invisible_K = train_dataset.K
+        estimator.mark_invisible_cells(
+            mark_invisible_K.unsqueeze(0).clone().to(device), 
+            train_dataset.camtoworlds.clone().to(device), 
+            train_dataset.width, 
+            train_dataset.height,
+            near_plane,
+        )
+    else:
+        estimator = estimator.to(device)
+        mark_invisible_K = train_dataset.K
+
+    # data_loader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     num_workers=16,
+    #     batch_size=None,
+    # )
+    # data_loader = itertools.cycle(data_loader)
+
+
+estimator = estimator.to(device)
 test_dataset = SubjectLoader(
     subject_id=args.scene,
     root_fp=args.data_root,
@@ -183,39 +225,23 @@ test_dataset = SubjectLoader(
     num_rays=None,
     **test_dataset_kwargs,
 )
-
 if args.scene in DNERF_SYNTHETIC_SCENES:
-    train_dataset = train_dataset.to(device)
     test_dataset = test_dataset.to(device)
 
-estimator = OccGridEstimator(
-    roi_aabb=aabb, resolution=grid_resolution, levels=grid_nlvl,
-)
+# if args.scene in HYPERNERF_SCENES and GUI:
+#     idx = torch.randint(0, len(train_dataset.K), (1,)).item()
+#     mark_invisible_K = train_dataset.K[idx]
+#     estimator.mark_invisible_cells(
+#         train_dataset.K[idx][None], 
+#         train_dataset.camtoworlds, 
+#         train_dataset.width, 
+#         train_dataset.height,
+#         near_plane,
+#     )
+#     # call mark_invisible_cells before sending the estimator to device.
+#     estimator = estimator.to(device)
+# el
 
-if args.scene in HYPERNERF_SCENES:
-    idx = torch.randint(0, len(train_dataset.K), (1,)).item()
-    mark_invisible_K = train_dataset.K
-    estimator.mark_invisible_cells(
-        mark_invisible_K, 
-        train_dataset.camtoworlds, 
-        [train_dataset.width, train_dataset.height],
-        near_plane,
-    )
-    # call mark_invisible_cells before sending the estimator to device.
-    estimator = estimator.to(device)
-elif args.scene in DYNERF_SCENES:
-    estimator = estimator.to(device)
-    mark_invisible_K = train_dataset.K
-    estimator.mark_invisible_cells(
-        mark_invisible_K.unsqueeze(0).clone().to(device), 
-        train_dataset.camtoworlds.clone().to(device), 
-        train_dataset.width, 
-        train_dataset.height,
-        near_plane,
-    )
-else:
-    estimator = estimator.to(device)
-    mark_invisible_K = train_dataset.K
 
 
 # setup the radiance field we want to train.
@@ -229,6 +255,7 @@ radiance_field = DNGPradianceField(
     use_time_attenuation=args.use_time_attenuation,
     use_feat_predict=args.use_feat_predict,
     use_weight_predict=args.use_weight_predict,
+    # hash4motion=True,
     # time_inject_before_sigma=False,
 ).to(device)
 
@@ -259,12 +286,15 @@ scheduler = torch.optim.lr_scheduler.ChainedScheduler(
 tic = time.time()
 # pre-set the len of train_dataloader to max_steps,
 # so that we can use just iterate over it.
+half_steps = max_steps // 2
 for step in range(max_steps + 1):
     radiance_field.train()
     estimator.train()
 
     i = torch.randint(0, len(train_dataset), (1,)).item()
     data = train_dataset[i]
+    # data = next(data_loader)
+    
     if args.scene in DNERF_SYNTHETIC_SCENES:
         render_bkgd = data["color_bkgd"]
         rays = data["rays"]
@@ -321,9 +351,10 @@ for step in range(max_steps + 1):
         # acc = acc[alive_ray_mask]
 
         # compute loss
-        loss = F.huber_loss(rgb, pixels)
+        loss = F.mse_loss(rgb, pixels)
 
-        # loss += (-acc*torch.log(acc)).mean()*1e-2
+        if args.use_opacity_loss:
+            loss += (-acc*torch.log(acc)).mean()*1e-3
 
         for interal_data in extra:
         
@@ -363,8 +394,7 @@ for step in range(max_steps + 1):
     grad_scaler.step(optimizer)
     scale = grad_scaler.get_scale()
     grad_scaler.update()
-    if not scale > grad_scaler.get_scale():
-        scheduler.step()
+    scheduler.step()
 
     if step % 10000 == 0:
         elapsed_time = time.time() - tic
@@ -378,12 +408,22 @@ for step in range(max_steps + 1):
         )
 
     if step > 0 and step % max_steps == 0:
+
+        torch.save(
+            {
+                "radiance_field": radiance_field.state_dict(),
+                "occupancy_grid": estimator.state_dict(),
+            },
+            "model.pth",
+        )
+
         # evaluation
         radiance_field.eval()
         estimator.eval()
 
         psnrs = []
         lpips = []
+        ssims = []
         with torch.no_grad():
             progress_bar = tqdm.tqdm(total=len(test_dataset), desc=f'evaluating: ')
 
@@ -431,10 +471,18 @@ for step in range(max_steps + 1):
                 mse = F.mse_loss(rgb, pixels)
                 psnr = -10.0 * torch.log(mse) / np.log(10.0)
                 psnrs.append(psnr.item())
+                ms_ssims = ms_ssim(
+                    pixels.permute(2, 0, 1)[None], rgb.permute(2,0,1)[None], data_range=1, size_average=True
+                )       
+                ssims.append(ms_ssims)
                 if test_step == 0:
                     imageio.imwrite(
                         "rgb_test.png",
                         (rgb.cpu().numpy() * 255).astype(np.uint8),
+                    )
+                    imageio.imwrite(
+                        "depth_test.png",
+                        depth2img(depth),
                     )
                     imageio.imwrite(
                         "rgb_error.png",
@@ -445,7 +493,48 @@ for step in range(max_steps + 1):
 
         progress_bar.close()
         psnr_avg = sum(psnrs) / len(psnrs)
-        print(f"evaluation: psnr_avg={psnr_avg}")
+        ssim_avg = sum(ssims) / len(ssims)
+        print(f"evaluation: psnr_avg={psnr_avg}, ssim_avg={ssim_avg}")
+
+
+if args.render_video:
+    if args.load_model:
+        checkpoint = torch.load("model.pth")
+        radiance_field.load_state_dict(checkpoint["radiance_field"])
+        estimator.load_state_dict(checkpoint["occupancy_grid"])
+        radiance_field.eval()
+        estimator.eval()
+    # render video
+    with torch.no_grad():
+        rgb_frames = []
+        depth_frames = []
+        progress_bar = tqdm.tqdm(total=len(test_dataset.render_poses), desc=f'rendering video: ')
+        render_bkgd = torch.zeros(3, device=device)
+        for render_step in range(test_dataset.render_poses.shape[0]):
+            progress_bar.update()
+            data = test_dataset.get_render_poses(render_step)
+            rays = namedtuple_map(lambda r: r.to(device), data["rays"])
+            timestamps = data["timestamps"].to(device)
+            rgb, acc, depth, _ = render_image_test(
+                1024,
+                radiance_field,
+                estimator,
+                rays,
+                # rendering options
+                near_plane=near_plane,
+                render_step_size=render_step_size,
+                render_bkgd=render_bkgd,
+                cone_angle=cone_angle,
+                alpha_thre=alpha_thre,
+                timestamps=timestamps,
+            )
+            rgb_frames.append(np.flip(rgb.cpu().numpy() * 255, axis=1).astype(np.uint8))
+            depth_frames.append(np.flip(depth2img(depth), axis=1))
+        progress_bar.close()
+        imageio.mimwrite('rgb_render.mp4', rgb_frames, fps=20)
+        imageio.mimwrite('depth_render.mp4', depth_frames, fps=20)
+
+
 
 if args.gui:
     torch.cuda.empty_cache()
