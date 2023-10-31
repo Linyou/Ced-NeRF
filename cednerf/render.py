@@ -10,6 +10,7 @@ def reduce_along_rays(
     values: Tensor,
     n_rays: Optional[int] = None,
     weights: Optional[Tensor] = None,
+    reduce: str = "mean",
 ) -> Tensor:
     """Accumulate and reduce volumetric values along the ray."""
     assert ray_indices.dim() == 1 and values.dim() == 2
@@ -34,7 +35,7 @@ def reduce_along_rays(
     ray_indices = ray_indices.int()
     index = ray_indices[:, None].long().expand(-1, src.shape[-1])
     outputs = torch.zeros((n_rays, src.shape[-1]), device=values.device, dtype=src.dtype)
-    outputs.scatter_reduce_(0, index, src, reduce="mean")
+    outputs.scatter_reduce_(0, index, src, reduce=reduce)
     return outputs
 
 
@@ -99,14 +100,16 @@ def rendering(
 
     if "interal_output" in sigma_results:
         interal_output = sigma_results["interal_output"]
-        selector = interal_output["selector"]
+        if "selector" in interal_output:
+            selector = interal_output["selector"]
         if "latent_losses" in interal_output:
             latent_losses = interal_output["latent_losses"]
             extras["latent_losses"] = reduce_along_rays(
                                 ray_indices,
                                 values=latent_losses,
                                 n_rays=n_rays,
-                                weights=weights[:, None],
+                                reduce="sum",
+                                weights=weights[:, None].detach(),
                             )
         if "weight_losses" in interal_output:
             target_weights = trans[:, None]
@@ -119,6 +122,19 @@ def rendering(
                             n_rays=n_rays,
                             weights=weights[:, None],
                         )
+            
+        # if "move" in interal_output:
+        #     move = interal_output["move"]
+            # extras["move"] = reduce_along_rays(
+            #                     ray_indices,
+            #                     values=move,
+            #                     n_rays=n_rays,
+            #                     reduce="sum",
+            #                     weights=weights[:, None].detach(),
+            #                 )
+            # extras["move"] = accumulate_along_rays(
+            #     weights.detach(), values=move[:, None], ray_indices=ray_indices, n_rays=n_rays
+            # )
         
 
     # move_norm_view = move_norm[:, None]

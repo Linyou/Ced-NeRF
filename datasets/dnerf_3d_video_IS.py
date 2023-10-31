@@ -75,7 +75,7 @@ def dynerf_ist_weight_nice(imgs, num_cameras, alpha=0.1, frame_shift=25):
     max_diff = torch.stack(max_diff_list)
     return max_diff
 
-def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=True):
+def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=True, load_every=1):
 
     scene = subject_id
 
@@ -140,12 +140,10 @@ def _load_data_from_json(root_fp, subject_id, factor=1, split='train', read_img=
     render_poses[:, :, 3] += np.array([[0,0,1.5]])
 
     if split == 'train':
-        load_every = 1
         video_list = video_list[1:]
         poses = poses[1:]
         bds = bds[1:]
     else:
-        load_every = 10
         video_list = video_list[:1]
         poses = poses[:1]
         bds = bds[:1]
@@ -254,7 +252,14 @@ class SubjectLoader(torch.utils.data.Dataset):
             instrinc,
             render_poses,
             self.median_imgs,
-        ) = _load_data_from_json(root_fp, subject_id, factor=factor, split=split, read_img=read_image)
+        ) = _load_data_from_json(
+            root_fp, 
+            subject_id, 
+            factor=factor, 
+            split=split, 
+            read_img=read_image,
+            load_every=1 if split == "train" else 10,
+        )
 
 
         basedir = os.path.join(root_fp, subject_id)

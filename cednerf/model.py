@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from .utils import trunc_exp
 from .encoder import SinusoidalEncoderWithExp, SinusoidalEncoder
 from .taichi_kernel.triplane import TriPlaneEncoder
+from .taichi_kernel.hash_encoder_half import HashEncoder
 
 try:
     import tinycudann as tcnn
@@ -23,6 +24,76 @@ except ImportError as e:
 
 
 MOVING_STEP = 1/(4096*1)
+
+class NGPDensityField(torch.nn.Module):
+    """Instance-NGP Density Field used for resampling"""
+
+    def __init__(
+        self,
+        aabb: Union[torch.Tensor, List[float]],
+        num_dim: int = 3,
+        density_activation: Callable = lambda x: trunc_exp(x - 1),
+        unbounded: bool = False,
+        base_resolution: int = 16,
+        max_resolution: int = 128,
+        n_levels: int = 5,
+        log2_hashmap_size: int = 17,
+    ) -> None:
+        super().__init__()
+        if not isinstance(aabb, torch.Tensor):
+            aabb = torch.tensor(aabb, dtype=torch.float32)
+        self.register_buffer("aabb", aabb)
+        self.num_dim = num_dim
+        self.density_activation = density_activation
+        self.unbounded = unbounded
+        self.base_resolution = base_resolution
+        self.max_resolution = max_resolution
+        self.n_levels = n_levels
+        self.log2_hashmap_size = log2_hashmap_size
+
+        per_level_scale = np.exp(
+            (np.log(max_resolution) - np.log(base_resolution)) / (n_levels - 1)
+        ).tolist()
+
+        self.mlp_base = tcnn.NetworkWithInputEncoding(
+            n_input_dims=num_dim,
+            n_output_dims=1,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": n_levels,
+                "n_features_per_level": 2,
+                "log2_hashmap_size": log2_hashmap_size,
+                "base_resolution": base_resolution,
+                "per_level_scale": per_level_scale,
+            },
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": 64,
+                "n_hidden_layers": 1,
+            },
+        )
+
+    def forward(self, positions: torch.Tensor):
+        if self.unbounded:
+            positions = contract_to_unisphere(positions, self.aabb)
+        else:
+            aabb_min, aabb_max = torch.split(self.aabb, self.num_dim, dim=-1)
+            positions = (positions - aabb_min) / (aabb_max - aabb_min)
+        selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
+        density_before_activation = (
+            self.mlp_base(positions.view(-1, self.num_dim))
+            .view(list(positions.shape[:-1]) + [1])
+            .to(positions)
+        )
+        density = (
+            self.density_activation(density_before_activation)
+            * selector[..., None]
+        )
+        return density
+
+
 class DNGPradianceField(torch.nn.Module):
     """Instance-NGP radiance Field"""
 
@@ -146,7 +217,7 @@ class DNGPradianceField(torch.nn.Module):
                     "activation": "ReLU",
                     "output_activation": "None",
                     "n_neurons": 64,
-                    "n_hidden_layers": 4,
+                    "n_hidden_layers": 3,
                 },
             )
 
@@ -180,6 +251,13 @@ class DNGPradianceField(torch.nn.Module):
             },
         )
         # self.hash_encoder = TriPlaneEncoder()
+        # self.hash_encoder = HashEncoder(
+        #     max_params=2**log2_hashmap_size,
+        #     levels=n_levels,
+        #     base_res=base_resolution,
+        #     max_res=dst_resolution,
+        #     feature_per_level=n_features_per_level,
+        # )
 
         input_dim4base = self.hash_encoder.n_output_dims
         self.geo_feat_dim_head = self.geo_feat_dim
@@ -348,9 +426,10 @@ class DNGPradianceField(torch.nn.Module):
                 results['base_mlp_out'] = base_mlp_out
 
         if return_interal:
+            interal_output = {}
+            interal_output['move'] = move
             if self.use_feat_predict or self.use_weight_predict:
                 temp_feat = torch.cat([x_move, t], dim=-1)
-                interal_output = {}
                 interal_output['selector'] = selector
 
                 if self.use_feat_predict:
@@ -361,7 +440,7 @@ class DNGPradianceField(torch.nn.Module):
                 if self.use_weight_predict:
                     interal_output['weight_losses'] = self.mlp_weight_prediction(temp_feat)
 
-                results['interal_output'] = interal_output
+            results['interal_output'] = interal_output
 
         return results
 

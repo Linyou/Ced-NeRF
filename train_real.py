@@ -81,6 +81,8 @@ print(args.data_root)
 device = "cuda:0"
 set_random_seed(42)
 
+
+lr = 1e-2
 if args.scene in DNERF_SYNTHETIC_SCENES:
     from datasets.dnerf_synthetic import SubjectLoader
     # training parameters
@@ -147,12 +149,12 @@ elif args.scene in HYPERNERF_SCENES:
     ]
 
 else:
-    from datasets.dnerf_3d_video import SubjectLoader
+    from datasets.dnerf_3d_video_IS import SubjectLoader
 
     # training parameters
-    max_steps = 20000
-    init_batch_size = 8192
-    target_sample_batch_size = 1 << 18
+    max_steps = 40000
+    init_batch_size = 1024
+    target_sample_batch_size = 1 << 20
     weight_decay = 0.0
     # scene parameters
     aabb = torch.tensor([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0])
@@ -161,11 +163,12 @@ else:
     # dataset parameters
     train_dataset_kwargs = {"color_bkgd_aug": "random", "factor": 4}
     test_dataset_kwargs = {"color_bkgd_aug": "black", "factor": 4}
+    
+    grid_nlvl = 4
     # model parameters
-    moving_step = 1/4096
-    hash_dst_resolution = 4096
+    moving_step = 1/(2048*grid_nlvl)
+    hash_dst_resolution = 2048*grid_nlvl
     grid_resolution = 128
-    grid_nlvl = 5
     # render parameters
     render_step_size = 1e-3
     alpha_thre = 1e-2
@@ -173,9 +176,10 @@ else:
     milestones=[
         max_steps // 2,
         max_steps * 3 // 4,
-        # max_steps * 5 // 6,
+        max_steps * 5 // 6,
         max_steps * 9 // 10,
     ]
+    lr = 1e-2
 
 
 estimator = OccGridEstimator(
@@ -211,7 +215,7 @@ else:
 
     # data_loader = torch.utils.data.DataLoader(
     #     train_dataset,
-    #     num_workers=16,
+    #     num_workers=4,
     #     batch_size=None,
     # )
     # data_loader = itertools.cycle(data_loader)
@@ -245,7 +249,7 @@ if args.scene in DNERF_SYNTHETIC_SCENES:
 
 
 # setup the radiance field we want to train.
-grad_scaler = torch.cuda.amp.GradScaler()
+grad_scaler = torch.cuda.amp.GradScaler(2**10)
 radiance_field = DNGPradianceField(
     aabb=estimator.aabbs[-1],
     moving_step=moving_step,
@@ -255,17 +259,18 @@ radiance_field = DNGPradianceField(
     use_time_attenuation=args.use_time_attenuation,
     use_feat_predict=args.use_feat_predict,
     use_weight_predict=args.use_weight_predict,
+    log2_hashmap_size=21,
     # hash4motion=True,
     # time_inject_before_sigma=False,
 ).to(device)
 
 try:
     import apex
-    optimizer = apex.optimizers.FusedAdam(radiance_field.parameters(), lr=1e-2, eps=1e-15)
+    optimizer = apex.optimizers.FusedAdam(radiance_field.parameters(), lr=lr, eps=1e-15)
 except ImportError:
     print("Failed to import apex FusedAdam, use torch Adam instead.")
     optimizer = torch.optim.Adam(
-        radiance_field.parameters(), lr=1e-2, eps=1e-15, weight_decay=weight_decay
+        radiance_field.parameters(), lr=lr, eps=1e-15, weight_decay=weight_decay
     )
 
 scheduler = torch.optim.lr_scheduler.ChainedScheduler(
@@ -293,6 +298,16 @@ for step in range(max_steps + 1):
 
     i = torch.randint(0, len(train_dataset), (1,)).item()
     data = train_dataset[i]
+    # if step == half_steps:
+    #     del data_loader
+    #     train_dataset.switch_to_ist()
+    #     data_loader = torch.utils.data.DataLoader(
+    #         train_dataset,
+    #         num_workers=4,
+    #         batch_size=None,
+    #     )
+    #     data_loader = itertools.cycle(data_loader)
+            
     # data = next(data_loader)
     
     if args.scene in DNERF_SYNTHETIC_SCENES:
@@ -352,14 +367,18 @@ for step in range(max_steps + 1):
 
         # compute loss
         loss = F.mse_loss(rgb, pixels)
+        
+        loss_extra = 0.0
 
         if args.use_opacity_loss:
-            loss += (-acc*torch.log(acc)).mean()*1e-3
+            loss_extra += (-acc*torch.log(acc)).mean()*1e-3
 
+        # extra_cat_chunk = []
         for interal_data in extra:
+            # extra_cat_chunk.append(interal_data['move'])
         
             if args.distortion_loss:
-                loss += distortion(
+                loss_extra += distortion(
                     interal_data['ray_indices'], 
                     interal_data['weights'], 
                     interal_data['t_starts'], 
@@ -370,20 +389,24 @@ for step in range(max_steps + 1):
                 T_last = 1 - acc
                 T_last = T_last.clamp(1e-6, 1-1e-6)
                 entropy_loss = -(T_last*torch.log(T_last) + (1-T_last)*torch.log(1-T_last)).mean()
-                loss += entropy_loss*1e-3
+                loss_extra += entropy_loss*1e-3
 
             if args.weight_rgbper:
                 rgbper = (interal_data['rgbs'] - pixels[interal_data['ray_indices']]).pow(2).sum(dim=-1)
-                loss += (rgbper * interal_data['weights'].detach()).sum() / pixels.shape[0] * 1e-3
+                loss_extra += (rgbper * interal_data['weights'].detach()).sum() / pixels.shape[0] * 1e-3
 
             if args.use_feat_predict:
                 # if args.scene in DNERF_SYNTHETIC_SCENES:
                     # loss += interal_data['latent_losses'][alive_ray_mask].mean()
                 # else:
-                    loss += interal_data['latent_losses'].mean()
+                    loss_extra += interal_data['latent_losses'].mean()
 
             if args.use_weight_predict:
-                loss += interal_data['weight_losses'].mean()
+                loss_extra += interal_data['weight_losses'].mean()
+
+        # move_all = torch.cat(extra_cat_chunk, dim=0)
+        # scale loss
+        loss = loss + loss_extra
 
     
     optimizer.zero_grad()

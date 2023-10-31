@@ -144,3 +144,5 @@ imgui.ini
 
 # ignore all png file in root directory
 *.png
+
+*.pth
